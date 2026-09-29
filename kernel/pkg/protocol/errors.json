@@ -1,0 +1,107 @@
+[
+  {
+    "code": -32015,
+    "diag": "E_BUSY_TIMEOUT",
+    "msg": "busy deadline exceeded and ping unresponsive"
+  },
+  {
+    "code": -32014,
+    "diag": "E_DEPS_HASH_MISMATCH",
+    "msg": "dependency lock hash mismatch"
+  },
+  {
+    "code": -32008,
+    "diag": "E_DEPS_INSTALL_FAILED",
+    "msg": "dependency install failed"
+  },
+  {
+    "code": -32007,
+    "diag": "E_DEPS_MISSING",
+    "msg": "dependency not installed"
+  },
+  {
+    "code": -32012,
+    "diag": "E_HANDSHAKE_REJECTED",
+    "msg": "handshake rejected (bad token/version)"
+  },
+  {
+    "code": -32011,
+    "diag": "E_HANDSHAKE_TIMEOUT",
+    "msg": "handshake timed out"
+  },
+  {
+    "code": -32006,
+    "diag": "E_HOTKEY_CONFLICT",
+    "msg": "hotkey conflict"
+  },
+  {
+    "code": -32010,
+    "diag": "E_IO",
+    "msg": "io error"
+  },
+  {
+    "code": -32601,
+    "diag": "E_METHOD_NOT_FOUND",
+    "msg": "method not found"
+  },
+  {
+    "code": -32017,
+    "diag": "E_MODEL_LOAD_TIMEOUT",
+    "msg": "model load exceeded timeout"
+  },
+  {
+    "code": -32700,
+    "diag": "E_PARSE",
+    "msg": "parse error"
+  },
+  {
+    "code": -32005,
+    "diag": "E_PERMISSION_DENIED",
+    "msg": "permission denied"
+  },
+  {
+    "code": -32002,
+    "diag": "E_PLUGIN_CRASHED",
+    "msg": "plugin crashed"
+  },
+  {
+    "code": -32000,
+    "diag": "E_PLUGIN_DOWN",
+    "msg": "plugin process not running"
+  },
+  {
+    "code": -32003,
+    "diag": "E_PLUGIN_MISSING",
+    "msg": "plugin not found"
+  },
+  {
+    "code": -32004,
+    "diag": "E_PLUGIN_STATE",
+    "msg": "plugin invalid state"
+  },
+  {
+    "code": -32013,
+    "diag": "E_STDOUT_CONTAMINATED",
+    "msg": "stdout contaminated with non-JSON data"
+  },
+  {
+    "code": -32009,
+    "diag": "E_STREAM_CLOSED",
+    "msg": "stream closed or missing"
+  },
+  {
+    "code": -32001,
+    "diag": "E_TIMEOUT",
+    "msg": "call timeout"
+  },
+  {
+    "code": -32016,
+    "diag": "E_TOOL_UNAVAILABLE",
+    "msg": "tool unavailable (locate failed)"
+  },
+  {
+    "code": -32018,
+    "diag": "E_VRAM_INSUFFICIENT",
+    "msg": "insufficient VRAM with no usable fallback"
+  }
+]

@@ -1,0 +1,108 @@
+/* ═══════ OCTplugin 插件共享主题 · 国风墨水 ═══════
+   与宿主 index.html 同一套令牌，保证所有插件 iframe 视觉统一。
+   用法：插件页 <link rel="stylesheet" href="/res/theme/plugin.css">
+   仅含设计令牌与通用组件；页面独有排版由各插件页另写。
+
+   偏好约定：动作按钮用暗金 #a8875a（勿用绿）；卡片不用蓝底；
+            代码块背景 #eae1d1。 */
+
+:root {
+  --paper:#f3ecdd; --paper-2:#e9e0cb;
+  --ink:#1e1b17; --ink-soft:#5c564c; --ink-faint:#8d8578;
+  --cinnabar:#b23a30; --cinnabar-soft:#c9604f;
+  --celadon:#4a6b73; --gold:#a8875a;
+  --line:rgba(30,27,23,.14); --card-line:rgba(30,27,23,.10);
+  --card:rgba(255,252,245,.5);
+  --shadow:0 10px 30px -18px rgba(30,27,23,.45);
+  --code:#eae1d1;
+  --font:'LXGW WenKai','STKaiti','KaiTi','Kaiti SC','STSong','Songti SC',
+         'Source Han Serif SC','Noto Serif CJK SC','SimSun',serif;
+}
+
+* { box-sizing:border-box; }
+
+html,body { height:100%; }
+body {
+  margin:0; padding:20px; background:transparent; color:var(--ink);
+  font-family:var(--font); -webkit-font-smoothing:antialiased;
+}
+
+/* ── 卡片 ───────────────────────────── */
+.card {
+  background:var(--card); border:1px solid var(--card-line); border-radius:14px;
+  box-shadow:var(--shadow); padding:18px; margin-bottom:16px;
+}
+.card > h3 {
+  margin:0 0 14px; font-size:14px; letter-spacing:3px; font-weight:700;
+  padding-left:10px; border-left:3px solid var(--gold); color:var(--ink);
+}
+
+/* ── 行布局 / 网格 ─────────────────── */
+.grid { display:grid; gap:16px; grid-template-columns:1fr 1fr; }
+@media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
+.row { display:flex; align-items:center; gap:10px; }
+.col { display:flex; flex-direction:column; gap:10px; }
+
+/* ── 按钮（Action=暗金；次级=描边墨） ── */
+.btn {
+  display:inline-flex; align-items:center; justify-content:center; gap:6px;
+  background:var(--gold); color:#FBF7EE; border:none; border-radius:9px;
+  padding:9px 16px; font-family:var(--font); font-size:13px; font-weight:700;
+  letter-spacing:2px; cursor:pointer; transition:filter .18s, transform .06s;
+}
+.btn:hover{ filter:brightness(1.07); }
+.btn:active{ transform:translateY(1px); }
+.btn.ghost{ background:transparent; color:var(--ink); border:1px solid var(--line); }
+.btn.ghost:hover{ border-color:var(--gold); color:var(--gold); }
+.btn.mini{ padding:4px 10px; font-size:12px; letter-spacing:1px; border-radius:7px; }
+.btn:disabled{ opacity:.45; cursor:not-allowed; }
+.btn .dot{ width:7px; height:7px; border-radius:50%; background:currentColor; }
+
+/* ── 表单 ───────────────────────────── */
+.field label{ display:block; color:var(--ink-soft); font-size:12px; letter-spacing:1px; margin:0 0 6px; }
+.field input, .field select {
+  width:100%; background:rgba(255,252,245,.55); border:1px solid var(--line);
+  border-radius:9px; padding:9px 12px; color:var(--ink); font-family:var(--font);
+  font-size:14px; outline:none;
+}
+.field input:focus, .field select:focus{ border-color:var(--gold); }
+
+/* ── 状态徽 / 标签 ─────────────────── */
+.tag {
+  display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
+  font-size:12px; font-weight:700; letter-spacing:1px; border:1px solid var(--card-line);
+}
+.tag.on  { color:var(--celadon); }
+.tag.off { color:var(--ink-faint); }
+.tag.done{ color:var(--gold); }
+.tag .dot{ width:7px; height:7px; border-radius:50%; }
+.tag.on .dot  { background:var(--celadon); }
+.tag.off .dot { background:var(--ink-faint); }
+.tag.done .dot{ background:var(--gold); }
+.tag .pill-dot{ }
+
+/* ── 列表行（任务等） ───────────────── */
+.list { display:flex; flex-direction:column; gap:8px; }
+.item {
+  display:flex; align-items:center; gap:10px; padding:9px 12px;
+  background:rgba(255,252,245,.4); border:1px solid var(--line); border-radius:10px;
+}
+.item.done .text{ text-decoration:line-through; color:var(--ink-faint); }
+.item .text{ flex:1; font-size:14px; color:var(--ink); }
+.item .check{
+  width:18px; height:18px; border-radius:5px; border:1.5px solid var(--gold);
+  flex:none; cursor:pointer; display:flex; align-items:center; justify-content:center;
+}
+.item.done .check{ background:var(--gold); }
+.item.done .check::after{ content:'✓'; color:#FBF7EE; font-size:12px; line-height:1; }
+
+/* ── 提示 / 次要文本 ───────────────── */
+.muted{ color:var(--ink-faint); font-size:12px; letter-spacing:1px; }
+.hint{ margin-top:8px; font-size:12px; color:var(--ink-soft); letter-spacing:1px; }
+
+/* ── 代码块（护眼 #eae1d1，块自带复制钮由插件页实现） ── */
+.code {
+  background:var(--code) !important; color:#3a352c; border-radius:10px;
+  padding:12px; font-size:12px; line-height:1.6; overflow:auto;
+  font-family:Consolas,'Courier New',monospace;
+}
