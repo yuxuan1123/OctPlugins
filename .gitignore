@@ -56,6 +56,6 @@ runtime/
 
 # 用户插件目录：一律不入库（第三方/本地安装均排除）
 /plugins/
-
+mvp_test/
 # 备份文件
 *.bak

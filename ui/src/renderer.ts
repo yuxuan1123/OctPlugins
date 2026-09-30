@@ -131,6 +131,8 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     function renderPlugins(plugins) {
       const nav = document.querySelector("nav.side");
       const border = document.getElementById("pluginArea");
+      // 侧栏/主页只展示普通插件（kind!==tool 且 kind!==overlay）；工具/overlay 仅在管理面板列出。
+      plugins = (plugins || []).filter(p => p && p.kind !== "tool" && p.kind !== "overlay");
       // 侧栏顺序以用户设置为主（user-settings.json ui.sidebarOrder，§17.2 B）；未配置时 home 置首、其余维持原序。
       plugins = orderedPlugins(plugins);
       // 清空上一次动态区（保留 设置/调试 的“工作区”与新组）
@@ -223,7 +225,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
         if (ev.origin && KERNEL_BASE && !("" + ev.origin).includes("127.0.0.1")) return;
         const url = KERNEL_BASE + String(d.path || "").replace(/^\//, "");
         ipcRenderer.invoke("win:openPluginWindow", {
-          url, title: d.title, width: d.width, height: d.height,
+          url, title: d.title, width: d.width, height: d.height, frameless: !!d.frameless,
         });
         return;
       }
@@ -244,18 +246,69 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
         })();
         return;
       }
+      // 通用工具(tool)桥：插件 iframe 经宿主 main 调任意 tool 进程（无量硬编码，toolId=manifest.id）。
+      // 工具事件由插件侧自己的 WS 订阅内核事件频道获得，宿主不中转具体事件负载。
+      if (d.type === "oct.tool.invoke") {
+        if (ev.origin && KERNEL_BASE && !("" + ev.origin).includes("127.0.0.1")) return;
+        const p: any = d.params || {};
+        ipcRenderer.invoke("tool:invoke", { toolId: p.toolId, method: p.method, params: p.params })
+          .then((r: any) => {
+            try { ev.source.postMessage({ type: "oct:tool:result", reqId: d.reqId || 0, ok: !!(r && r.ok), result: (r && r.result) || null, error: (r && r.error) || "" }, "*" as any); }
+            catch (e) { /* 忽略 */ }
+          });
+        return;
+      }
+      // 插件登记：它想接收来自某 toolId 的事件（宿主按 source 转发给该 iframe）。
+      if (d.type === "oct.tool.subscribe") {
+        const pid = pidOfFrame(ev.source);
+        if (pid && d.toolId) {
+          if (!toolSubs.has(d.toolId)) toolSubs.set(d.toolId, new Set());
+          toolSubs.get(d.toolId)!.add(pid);
+        }
+        return;
+      }
+      // 通用剪贴板写入：插件 iframe 在取色期间非焦点文档，navigator.clipboard 会被静默拒绝，转主进程写。
+      if (d.type === "oct.clipboard.write") {
+        if (typeof d.text === "string") ipcRenderer.invoke("clipboard:write", { text: d.text });
+        return;
+      }
+      // 通用 overlay：请求宿主开/关某 kind:"overlay" 插件为其全屏透明鼠标穿透窗。
+      if (d.type === "oct.overlay") {
+        if (ev.origin && KERNEL_BASE && !("" + ev.origin).includes("127.0.0.1")) return;
+        const pluginId = d.pluginId, toolId = d.toolId;
+        if (d.action === "open" && pluginId) ipcRenderer.invoke("overlay:open", { pluginId, toolId });
+        else if (d.action === "close" && pluginId) ipcRenderer.invoke("overlay:close", { pluginId });
+        return;
+      }
     });
+    // toolId → 订阅它的插件 iframe id 集合（宿主据此把 tool 事件转发给对应插件页）。
+    const toolSubs: Map<string, Set<string>> = new Map();
+    function pidOfFrame(w: any): string {
+      const frames: any = document.querySelectorAll("iframe[data-plugin]");
+      for (const f of frames) if (f.contentWindow === w) return f.getAttribute("data-plugin");
+      return "";
+    }
+    // 向指定插件 iframe 转发事件（contentWindow.postMessage 由其打开；targetOrigin '*' 保持与握手一致）
+    function forwardToPlugin(pid: string, obj: any) {
+      try {
+        const fr: any = document.querySelector(`iframe[data-plugin="${pid}"]`);
+        if (fr && fr.contentWindow) fr.contentWindow.postMessage(obj, "*" as any);
+      } catch (e) { /* 忽略 */ }
+    }
 
     // ── 阶段1 · 「添加插件」管理面板 ──
     const PLUGIN_ROLE = {}; // pluginId -> 'core'|'others'（用于全局预设时区分核心/其余）
     async function refreshMgmt() {
       try {
         const r = await rpc("plugin.list", {});
+        // 插件管理面板（pluginMgmt）仍列出全部条目（含 kind:"tool" 工具，供管理）；
+        // 工具化展示见「工具」Tab（refreshTools）。侧栏/主页已由 renderPlugins 过滤 tool。
         const list = r.plugins || [];
         $("mgmtList").innerHTML = list.length ? list.map(p =>
           `<div class="perm" style="flex-wrap:wrap"><span>
             <input type="checkbox" data-pid="${p.pluginId}" data-type="${p.type}" data-ui="${p.ui && p.ui.type || ''}">
             <span style="color:var(--ink)">${p.name || p.pluginId}</span>
+            ${p.kind === "tool" ? `<span class="tool-badge">工具</span>` : ""}
             <span style="color:var(--ink-faint);font-size:11px;margin-left:8px">${p.type}${p.ui && p.ui.type === 'web' ? ' · 网页UI' : ''}</span>
           </span>
           <button class="mini" data-rm="${p.pluginId}">移除</button>
@@ -272,6 +325,37 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
         // 载入全部插件生命周期，用于引用标记
         for (const p of list) PLUGIN_ROLE[p.pluginId] = r._core && r._core.includes(p.pluginId) ? 'core' : 'others';
       } catch (e) { $("mgmtList").textContent = "读取失败：" + e.message; }
+    }
+    // ── 「工具」管理面板（kind:"tool" 无 UI 进程实体，不进侧栏/主页，仅在此列出/导入/移除） ──
+    async function refreshTools() {
+      try {
+        const r = await rpc("plugin.list", {});
+        const tools = (r.plugins || []).filter(p => p && p.kind === "tool");
+        $("toolMgmtList").innerHTML = tools.length ? tools.map(p =>
+          `<div class="perm" style="flex-wrap:wrap"><span>
+            <input type="checkbox" data-pid="${p.pluginId}" data-tool="1">
+            <span style="color:var(--ink)">${p.name || p.pluginId}</span>
+            <span class="tool-badge">工具</span>
+            <span style="color:var(--ink-faint);font-size:11px;margin-left:6px">${p.type} · ${p.state || ''}</span>
+          </span>
+          <button class="mini" data-rmtool="${p.pluginId}">移除</button></div>`).join("")
+          : "（暂无工具）。可点击右方「选择工具源目录并导入」导入 kind:\"tool\" 的进程工具。";
+        $("toolMgmtList").querySelectorAll("[data-rmtool]").forEach(b => b.onclick = async (e) => {
+          e.stopPropagation();
+          if (!confirm(`确定移除工具 ${b.dataset.rmtool}？（将删除其目录）`)) return;
+          try { await rpc("plugin.remove", { pluginId: b.dataset.rmtool }); $("toolMgmtLog").textContent = "已移除工具 " + b.dataset.rmtool; refreshTools(); }
+          catch (err) { $("toolMgmtLog").textContent = "移除失败：" + err.message; }
+        });
+      } catch (e) { $("toolMgmtList").textContent = "读取失败：" + e.message; }
+    }
+    // 添加插件面板 Tab 切换（插件 / 工具）
+    function switchAddTab(tab) {
+      const isTool = tab === "tools";
+      $("tabPlugins").classList.toggle("active", !isTool);
+      $("tabTools").classList.toggle("active", isTool);
+      $("tabPluginsBody").classList.toggle("add-tools-hidden", isTool);
+      $("tabToolsBody").classList.toggle("add-tools-hidden", !isTool);
+      if (isTool) refreshTools();
     }
     // 单插件生命周期编辑器：拉取视图渲染表单，保存调 plugin.updateSettings
     // 挂在指定容器 box 下；id 唯一前缀用于多容器（管理列表 / 设置列表）复用。
@@ -478,6 +562,10 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     $("presetLazy").onclick = () => applyGlobalPreset("lazy", {});
     $("btnLcRefresh").onclick = () => loadPerPluginList(true);
     $("btnMgmtRefresh").onclick = refreshMgmt;
+    $("btnRelaunch").onclick = async () => {
+      if (!confirm("确定重启应用？未保存的编辑内容可能丢失。")) return;
+      await ipcRenderer.invoke("app:relaunch");
+    };
     $("btnPick").onclick = async () => {
       try {
         const dir = await ipcRenderer.invoke("dialog:pickDir");
@@ -486,7 +574,23 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
         const imp = await rpc("plugin.import", { srcPath: dir.path });
         $("mgmtLog").textContent = "已导入 → 检查依赖（若提示未就绪请点“依赖→安装并重启”）。";
         refreshMgmt();
+        // 导入后立即重建侧栏与面板（否则要到 kernel:ready / 重启才出现）
+        try { renderPlugins((await rpc("plugin.list", {})).plugins || []); } catch (e) {}
       } catch (e) { $("mgmtLog").textContent = "导入失败：" + e.message; }
+    };
+    // 「工具」Tab 切换与导入（kind:"tool" 进程工具，复用 dialog:pickDir + plugin.import）
+    $("tabPlugins").onclick = () => switchAddTab("plugins");
+    $("tabTools").onclick = () => switchAddTab("tools");
+    $("btnToolRefresh").onclick = refreshTools;
+    $("btnToolPick").onclick = async () => {
+      try {
+        const dir = await ipcRenderer.invoke("dialog:pickDir");
+        if (dir.canceled) return;
+        $("toolMgmtLog").textContent = "导入工具中：" + dir.path;
+        await rpc("plugin.import", { srcPath: dir.path });
+        $("toolMgmtLog").textContent = "已导入工具 → 若其 manifest.kind 为 \"tool\" 会显示在本面板。";
+        refreshTools();
+      } catch (e) { $("toolMgmtLog").textContent = "导入失败：" + e.message; }
     };
 
     function ensurePluginFrame(pid) {
@@ -523,6 +627,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       loadDepCfg();
       refreshFns();
       refreshMgmt();
+      refreshTools();
       wirePluginPicker(); // 搜索+下拉选择交互（只挂一次，loadPerPluginList 只重建选项）
       loadPerPluginList();
       openDefaultPlugin(); // 启动后默认打开用户在设置中指定的插件页（默认 home）
@@ -1106,6 +1211,18 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       if (p.source === "kernel" && p.type === "plugin.state" && p.data && p.data.id) {
         const b = document.querySelector(`nav.side .side-btn[data-plugin-id="${CSS.escape ? CSS.escape(p.data.id) : p.data.id}"]`);
         if (b) paintDot(b, p.data.state, b.classList.contains("disabled"));
+      }
+      // 通用 tool 事件转发：把 tool(source) 发起的事件投给订阅它的插件 iframe。
+      // 跳过 cursor 高频帧（放大镜画面由宿主直接投给 overlay 窗渲染），只把业务/收尾事件送插件页。
+      if (p.source && p.source !== "kernel") {
+        const pids = toolSubs.get(p.source);
+        if (pids && pids.size) {
+          let inner = p.data;
+          if (typeof inner === "string") { try { inner = JSON.parse(inner); } catch (e) { inner = null; } }
+          if (!(inner && inner.type === "cursor")) {
+            pids.forEach((pid) => forwardToPlugin(pid, { type: "oct:tool:event", source: p.source, dataType: p.type, data: p.data }));
+          }
+        }
       }
     });
 

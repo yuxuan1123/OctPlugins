@@ -255,7 +255,13 @@ func (m *Manager) applySpawnWire(p *Plugin) {
 }
 
 // interp 按插件类型解析解释器路径；第二返回值 true 表示 Node 插件。
+// Go 插件：返回二进制绝对路径作为「解释器」，Start 据此直接执行（不再拼接 entry）。
 func (m *Manager) interp(mf Manifest) (string, bool) {
+	// Go 插件：entry 即编译后的二进制，直接执行，无解释器。
+	if isGoType(mf.Type) {
+		return filepath.Join(mf.Dir, mf.Entry), false
+	}
+
 	// 读取快照（可在启动时安全调用）
 	m.mu.Lock()
 	nodeBin, venvPython := m.nodeBin, m.venvPython
@@ -283,11 +289,21 @@ func isNodeType(t string) bool {
 	return strings.Contains(lt, "node") || strings.Contains(lt, "js") || strings.Contains(lt, "javascript")
 }
 
+// isGoType 判断是否为 Go 编译型插件（entry 为可直接执行的二进制）。
+func isGoType(t string) bool {
+	lt := strings.ToLower(strings.TrimSpace(t))
+	return lt == "go" || lt == "golang"
+}
+
 // pluginReady 判断插件是否可启动（依赖是否就绪）。
 // Node：需 node 解释器可用 且 node_modules 依赖就绪（depsReady）才就绪，
 //       否则走 §6.4 后台安装 gating（package.json 有依赖但未装 node_modules → 触发 pnpm 安装）；
 // Python：需已注入的就绪判定通过（默认通过，等价旧行为）。
 func (m *Manager) pluginReady(mf Manifest) bool {
+	// Go 编译型插件：二进制已随包分发，无解释器/依赖安装步骤，直接就绪。
+	if isGoType(mf.Type) {
+		return true
+	}
 	isNode := isNodeType(mf.Type)
 	m.mu.Lock()
 	nodeBin := m.nodeBin

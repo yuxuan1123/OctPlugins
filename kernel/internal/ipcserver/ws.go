@@ -30,9 +30,9 @@ type Server struct {
 	smanager     *lifecycle.Manager
 	gate         *perms.Gate
 	installer    *runtime.Installer
-	resourcesDir string // 阶段E：共享资源根目录（内核对宿主/插件暴露 resources/）
-	pluginsDir   string // 阶段G：插件 UI 静态文件根（内核对宿主 iframe 暴露 /plugin/）
-	stateDir     string // §17.3：内核独占写 state/；host 经 RPC 读写，不得直连文件
+	resourcesDir string           // 阶段E：共享资源根目录（内核对宿主/插件暴露 resources/）
+	pluginsDir   string           // 阶段G：插件 UI 静态文件根（内核对宿主 iframe 暴露 /plugin/）
+	stateDir     string           // §17.3：内核独占写 state/；host 经 RPC 读写，不得直连文件
 	settings     *config.Settings // §9：config/user-settings.json（settingsSchema 驱动设置页的落点）
 	mu           sync.Mutex
 	conn         *websocket.Conn
@@ -270,7 +270,7 @@ func (s *Server) handleList(conn *websocket.Conn, req protocol.Request) {
 	for _, sm := range sums {
 		res = append(res, map[string]any{
 			"pluginId": sm.ID, "name": sm.Name, "type": sm.Type,
-			"state": sm.State, "disabled": sm.Disabled, "ui": sm.UI,
+			"kind": sm.Kind, "state": sm.State, "disabled": sm.Disabled, "ui": sm.UI,
 		})
 	}
 	s.reply(conn, protocol.NewResult(req.ID, map[string]any{"plugins": res}))
@@ -290,7 +290,7 @@ func (s *Server) handlePluginDetails(conn *websocket.Conn, req protocol.Request)
 	decl, granted, high := s.gate.Subset(mf.ID)
 	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
 		"pluginId": mf.ID, "name": mf.Name, "type": mf.Type, "entry": mf.Entry,
-		"loadMode": mf.LoadMode, "uiMode": mf.UIMode, "ui": mf.UI,
+		"kind": mf.Kind, "loadMode": mf.LoadMode, "uiMode": mf.UIMode, "ui": mf.UI,
 		"permissionsDeclared": decl, "permissionsGranted": granted,
 		"highRisk":     high,
 		"dependencies": mf.Dependencies,
@@ -790,7 +790,7 @@ func (s *Server) handleCall(conn *websocket.Conn, req protocol.Request) {
 // 资源设置（模型加载路径/策略）落盘 state/plugins/<pid>/models.json（§5.1：用户数据
 // 一律在 state/plugins/<id>/ 下，绝不写入插件包 plugins/<id>/store/）。
 
-// stateJSON 读 state 下相对路径的 JSON 文件；不存在返回 `` 与 nil。
+// stateJSON 读 state 下相对路径的 JSON 文件；不存在返回 “ 与 nil。
 func (s *Server) stateJSON(rel string) (map[string]any, error) {
 	if s.stateDir == "" {
 		return nil, fmt.Errorf("state dir not configured")

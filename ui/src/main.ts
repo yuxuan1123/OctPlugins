@@ -5,7 +5,7 @@
 //   4) 调 plugin.list → 结果在窗口显示。
 export {};
 
-const { app, BrowserWindow, dialog, ipcMain, globalShortcut, Tray, Menu, nativeImage } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, globalShortcut, Tray, Menu, nativeImage, clipboard, screen } = require("electron");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
@@ -31,6 +31,97 @@ let tray = null;
 let seq = 0;
 let kernelAuth = null; // 内核地址/token，供新开插件子窗口复用
 
+// ── 通用工具(tool)桥 ───────────────────────
+// 宿主零硬编码：不承载任何 tool 具体逻辑，只负责经内核向 tool 进程转发调用（tool:invoke）
+// 与把 tool 事件回吐给插件 iframe（tool:event）。
+// tool 是与插件同级的进程实体（kind:"tool"，见内核 Manifest.Kind），由内核插件进程管理
+// 层负责启停/回收；宿主经 WS → 内核 → tool 进程调用。toolId 即内核中的插件 id（manifest.id）。
+// 状态缓存：tool 事件触发者往往是宿主代理发起，这里只维护最近一次事件以便回吐给调用插件。
+let toolLastEvent = null;
+
+// 通用 overlay 窗口管理（非取色专属）：任何插件都能请求宿主把它（kind:"overlay"）的 ui 页
+// 开成全屏透明、置顶、鼠标穿透的窗口。由 pluginId 索引 window，以便关闭；由 toolId 索引
+// 路由（tool 发的内核事件要投给哪个 overlay 窗）。
+const overlayWindows: Map<string, InstanceType<typeof BrowserWindow>> = new Map();
+const overlayRoute: Map<string, InstanceType<typeof BrowserWindow>> = new Map(); // toolId → overlay window
+
+// 宿主主进程侧不直接 require 任何 .node，也不持有 overlay 取色逻辑。取色等能力由
+// napi_rs_tool 经插件进程通道提供；放大镜 overlay 是 kind:"overlay" 插件，由宿主把其 ui 页
+// 开成全屏透明窗渲染（透明放大镜），取色业务编排在 colorpicker 插件内。
+
+// 通用 tool 桥：经内核转发给 toolId 对应进程（复用 rpc() 到内核的通道）。
+// tool 是被内核按插件进程管理的 "kind":"tool" 实体（见内核 Manifest.Kind），故经
+// plugin.call 调用其方法；toolId = manifest.id。
+ipcMain.handle("tool:invoke", async (e, payload) => rpc("plugin.call", {
+  pluginId: payload && payload.toolId,
+  method: payload && payload.method,
+  params: payload && payload.params,
+}, 20000));
+// 通用 tool 事件回吐：宿主把内核广播到 tool 的事件转给请求订阅的插件（MVP 由调用方登记）。
+ipcMain.handle("tool:subscribe", async (e, payload) => {
+  toolLastEvent = payload || null;
+  return { ok: true };
+});
+
+// 通用剪贴板写入：插件 iframe 在全屏 overlay 取色期间不是焦点文档，
+// navigator.clipboard.writeText 会被 Chromium 静默拒绝；主进程 clipboard 与焦点无关。
+ipcMain.handle("clipboard:write", async (e, payload: any = {}) => {
+  const text = payload && payload.text;
+  if (typeof text !== "string") return { ok: false, error: "缺 text" };
+  try { clipboard.writeText(text); return { ok: true }; }
+  catch (err: any) { return { ok: false, error: String((err && err.message) || err) }; }
+});
+
+// 通用 overlay：把某插件（kind:"overlay"）的 ui 页开成全屏透明、置顶、鼠标穿透窗口。
+// pluginId 用于定位/关闭窗口；toolId 用于把该 tool 发来的内核事件路由到此 overlay 窗。
+ipcMain.handle("overlay:open", async (e, payload: any = {}) => {
+  const pluginId = payload.pluginId;
+  const toolId = payload.toolId;
+  if (!pluginId) return { ok: false, error: "缺 pluginId" };
+  // 只允许已登记的 overlay(kind) 插件？内核清单里取 ui 入口；找不到则拒。
+  let entry = "";
+  try {
+    const r = await rpc("plugin.list", {});
+    const found = (r && r.plugins || []).find((p: any) => p.pluginId === pluginId);
+    entry = found && found.ui && found.ui.entry || "";
+  } catch (err) { /* 下面按空 entry 处理 */ }
+  const base = path.join(RUNTIME_ROOT, "plugins", pluginId);
+  const file = entry ? (path.isAbsolute(entry) ? entry : path.join(base, entry)) : "";
+  if (!entry) return { ok: false, error: "未找到插件 ui 入口: " + pluginId };
+
+  let win = overlayWindows.get(pluginId);
+  if (win && !win.isDestroyed()) { return { ok: true }; } // 已开
+  const bounds = screen.getPrimaryDisplay().bounds;
+  win = new BrowserWindow({
+    x: bounds.x, y: bounds.y,
+    width: bounds.width, height: bounds.height,
+    transparent: true, frame: false, resizable: false, movable: false,
+    alwaysOnTop: true, skipTaskbar: true, hasShadow: false,
+    focusable: true, enableLargerThanScreen: true,
+    backgroundColor: "#00000000",
+    webPreferences: { nodeIntegration: true, contextIsolation: false },
+  });
+  win.setAlwaysOnTop(true, "screen-saver");
+  win.setIgnoreMouseEvents(true, { forward: true }); // 全穿透：点按语义由取色 native 钩子处理
+  win.on("closed", () => {
+    overlayWindows.delete(pluginId);
+    if (overlayRoute.get(toolId) === win) overlayRoute.delete(toolId);
+  });
+  win.loadFile(file);
+  overlayWindows.set(pluginId, win);
+  if (toolId) overlayRoute.set(toolId, win);
+  return { ok: true };
+});
+// 关闭并注销 overlay 窗口。
+ipcMain.handle("overlay:close", async (e, payload: any = {}) => {
+  const pluginId = payload.pluginId;
+  const win = overlayWindows.get(pluginId);
+  if (win && !win.isDestroyed()) win.destroy();
+  overlayWindows.delete(pluginId);
+  overlayRoute.forEach((v, k) => { if (v === win) overlayRoute.delete(k); });
+  return { ok: true };
+});
+
 // 给宿主主进程一个可辨认的标题（任务管理器/进程列表里更容易区分）
 process.title = "OCTplugin · 墨韵工作台";
 
@@ -44,11 +135,27 @@ ipcMain.handle("win:openPluginWindow", async (e, opts) => {
   const sub = new BrowserWindow({
     width: opts.width || 960, height: opts.height || 720,
     title: opts.title || "插件窗口", icon: APP_LOGO,
+    frame: !opts.frameless, // 自绘标题栏：frameless:true → frame:false（去掉原生标题栏）+ preload 注入
     autoHideMenuBar: true,
-    webPreferences: { nodeIntegration: false, contextIsolation: true },
+    webPreferences: {
+      nodeIntegration: false, contextIsolation: true,
+      preload: opts.frameless ? require("path").join(__dirname, "editor-preload.js") : undefined,
+    },
   });
+  const emitSubState = () => { try { sub.webContents.send("win:state", sub.isMaximized() ? "max" : "normal"); } catch (e) {} };
+  sub.on("maximize", emitSubState);
+  sub.on("unmaximize", emitSubState);
   sub.loadURL(full);
   return { ok: true };
+});
+
+// 子窗口窗口控制：自绘标题栏按钮 → 最小化 / 最大化(切换) / 关闭
+ipcMain.on("win:ctrl", (e, act) => {
+  const w = BrowserWindow.fromWebContents(e.sender);
+  if (!w) return;
+  if (act === "min") w.minimize();
+  else if (act === "max") w.isMaximized() ? w.unmaximize() : w.maximize();
+  else if (act === "close") w.close();
 });
 
 // 设置子窗口：在主窗口外以独立小窗打开“某一项设置表单”（parent:win 使关闭主窗时一并清理）。
@@ -77,6 +184,13 @@ ipcMain.handle("win:openSettings", async (e, { sec }: any = {}) => {
 ipcMain.handle("win:closeSelf", (e) => {
   const w = BrowserWindow.fromWebContents(e.sender);
   if (w) w.close();
+  return { ok: true };
+});
+
+// 重启应用：导入新插件后宿主通常需重建内核/刷新侧栏，直接重启最省事。
+ipcMain.handle("app:relaunch", () => {
+  app.relaunch();
+  app.exit(0);
   return { ok: true };
 });
 
@@ -502,7 +616,23 @@ function connect(auth: any): Promise<any> {
       ws.on("message", (m) => {
         const msg = JSON.parse(m.toString());
         if (msg.id === id) resolve(msg);
-        else win.webContents.send("kernel:event", JSON.stringify(msg));
+        else {
+          const p = (msg && msg.params) || {};
+          // 区分器：宿主一收到插件事件即向任一 overlay 投一可见提示，用于判定断点(无需终端)。
+          if (p.source) {
+            const anyOv = overlayWindows.size ? overlayWindows.values().next().value : undefined;
+            if (anyOv && !anyOv.isDestroyed()) {
+              try { anyOv.webContents.send("overlay:echo", JSON.stringify({ source: p.source, type: msg.params.type })); } catch (e) {}
+            }
+          }
+          const ov = p.source ? overlayRoute.get(p.source) : undefined;
+          if (ov && !ov.isDestroyed()) {
+            try { ov.webContents.send("overlay:event", JSON.stringify(msg)); } catch (e) {}
+          } else if (p.source) {
+            console.log("[overlay:miss]", p.source, msg.method, "route=", !!overlayRoute.get(p.source));
+          }
+          win.webContents.send("kernel:event", JSON.stringify(msg));
+        }
       });
     });
     ws.on("error", reject);
@@ -511,6 +641,10 @@ function connect(auth: any): Promise<any> {
 
 function rpc(method, params, timeoutMs = 15000): Promise<any> {
   return new Promise<any>((resolve, reject) => {
+    if (!ws) {
+      reject(new Error("内核未连接（ws 为空）— 请检查 kerneld.exe 是否存在并成功启动"));
+      return;
+    }
     const id = ++seq;
     ws.send(JSON.stringify({ v: 1, jsonrpc: "2.0", id, method, params }));
     const timer = setTimeout(() => { ws.off("message", onMsg); reject(new Error("RPC 超时: " + method)); }, timeoutMs || 15000);
@@ -557,7 +691,12 @@ function registerShortcuts() {
   }
 }
 
-app.on("will-quit", () => { globalShortcut.unregisterAll(); });
+app.on("will-quit", () => {
+  globalShortcut.unregisterAll();
+  overlayWindows.forEach((w) => { if (w && !w.isDestroyed()) w.destroy(); });
+  overlayWindows.clear();
+  overlayRoute.clear();
+});
 
 app.on("window-all-closed", () => {
   if (kernelProc) kernelProc.kill();

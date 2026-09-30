@@ -30,6 +30,9 @@ type Manifest struct {
 	UIMode  string `json:"ui_mode"`
 	Dir     string `json:"-"`
 	Py3v    string `json:"python_version,omitempty"` // 默认 "3.12"
+	// Kind 插件/工具类别（§：app 普通插件 | tool 无 UI 工具）。tool 复用同一进程管理通道，
+	// 仅在侧栏/设置作外显区分。缺省为 "app"。
+	Kind string `json:"kind,omitempty"`
 	LifecyclePolicy
 	ManifestFields
 }
@@ -113,17 +116,29 @@ func (p *Plugin) SetSdkPythonPath(sdkPythonPath string) {
 }
 
 // Start 启动插件子进程并开始读循环。解释器由调用方（Manager）解析。
+// Go 插件：pythonPath 即二进制绝对路径，直接执行（不再拼接 entry）。
 func (p *Plugin) Start(pythonPath string) error {
-	pyVersion := p.Manifest.Py3v
-	if pyVersion == "" {
-		pyVersion = "3.12"
+	var cmd *exec.Cmd
+	if isGoType(p.Manifest.Type) {
+		// Go 编译型插件：pythonPath 已是二进制绝对路径，直接执行。
+		cmd = exec.Command(pythonPath)
+	} else {
+		pyVersion := p.Manifest.Py3v
+		if pyVersion == "" {
+			pyVersion = "3.12"
+		}
+		cmd = exec.Command(pythonPath, filepath.Join(p.Manifest.Dir, p.Manifest.Entry))
 	}
-	cmd := exec.Command(pythonPath, filepath.Join(p.Manifest.Dir, p.Manifest.Entry))
 	cmd.Dir = p.Manifest.Dir
 	// §13.2：Starts 前建立进程隔离（Unix 进程组 / Windows 由 hideConsoleWindow 的 CREATE_SUSPENDED 接管）。
 	process.PreStartAttrs(cmd)
 	// §5.2/§11.2/§11.4：注入数据目录、握手 token、环境清理（stdout 协议专用）。
-	cmd.Env = process.BuildPluginEnv(os.Environ(), p.channelToken, p.Manifest.Dir, p.dataDir, p.sdkPythonPath)
+	// Go 插件不注入 PYTHONUNBUFFERED/PYTHONPATH（SDK 路径对其无意义）。
+	if isGoType(p.Manifest.Type) {
+		cmd.Env = process.BuildPluginEnv(os.Environ(), p.channelToken, p.Manifest.Dir, p.dataDir, "")
+	} else {
+		cmd.Env = process.BuildPluginEnv(os.Environ(), p.channelToken, p.Manifest.Dir, p.dataDir, p.sdkPythonPath)
+	}
 	hideConsoleWindow(cmd) // Windows: 不弹黑窗口；其它平台：空实现
 
 	stdin, err := cmd.StdinPipe()

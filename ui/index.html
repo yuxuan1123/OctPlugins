@@ -152,6 +152,14 @@
     .risk { color:var(--cinnabar); font-size:11px; font-weight:700; border:1px solid rgba(178,58,48,.35);
       border-radius:6px; padding:1px 6px; background:rgba(178,58,48,.06); letter-spacing:1px; }
 
+    /* ── 添加插件面板 · 插件/工具 分类切换 ── */
+    .add-tabs { display:flex; gap:10px; margin-bottom:16px; }
+    .add-tab { letter-spacing:3px; }
+    .add-tab.active { background:var(--ink); color:var(--paper); border-color:var(--ink); }
+    .tool-badge { color:var(--celadon); font-size:11px; font-weight:700; border:1px solid rgba(74,107,115,.35);
+      border-radius:6px; padding:1px 6px; background:rgba(74,107,115,.08); letter-spacing:1px; }
+    .add-tools-hidden { display:none; }
+
     /* ── 阶段K · LibreOffice 引擎设置 ── */
     .lo-src { font-size:13px; color:var(--ink-soft); cursor:pointer; display:inline-flex; align-items:center; gap:6px; }
     .lo-src input { accent-color:var(--cinnabar); }
@@ -418,19 +426,51 @@
 
       <!-- 添加插件面板（阶段1 · 插件管理/导入） -->
       <section class="panel" id="panel-add">
-        <div class="grid">
-          <div class="card">
-            <h2>已安装插件</h2>
-            <div id="mgmtList">连接后加载…</div>
-          </div>
-          <div class="card">
-            <h2>导入 / 移除</h2>
-            <div class="row">
-              <button id="btnPick">选择插件源目录并导入</button>
-              <button class="outline" id="btnMgmtRefresh">刷新列表</button>
+        <!-- 分类切换：插件 / 工具。工具(kind:"tool")为无 UI 的进程实体，单独管理，不进侧栏/主页。 -->
+        <div class="add-tabs">
+          <button class="add-tab active" id="tabPlugins">插件</button>
+          <button class="add-tab" id="tabTools">工具</button>
+        </div>
+
+        <!-- 插件 Tab -->
+        <div id="tabPluginsBody">
+          <div class="grid">
+            <div class="card">
+              <h2>已安装插件</h2>
+              <div id="mgmtList">连接后加载…</div>
             </div>
-            <label>选中的插件（导入后需再次“安装依赖”）</label>
-            <pre id="mgmtLog">…</pre>
+            <div class="card">
+              <h2>导入 / 移除</h2>
+              <div class="row">
+                <button id="btnPick">选择插件源目录并导入</button>
+                <button class="outline" id="btnMgmtRefresh">刷新列表</button>
+              </div>
+              <div class="row">
+                <button class="outline" id="btnRelaunch" style="color:var(--cinnabar)">重启应用</button>
+                <label style="flex:1;align-self:center;font-size:12px;color:var(--ink-soft)">导入新插件后侧栏未更新时，点此重启（或点上方「刷新列表」）。</label>
+              </div>
+              <label>选中的插件（导入后需再次“安装依赖”）</label>
+              <pre id="mgmtLog">…</pre>
+            </div>
+          </div>
+        </div>
+
+        <!-- 工具 Tab：列出/导入/移除 kind:"tool" 的进程工具（无 UI，不进侧栏） -->
+        <div id="tabToolsBody" class="add-tools-hidden">
+          <div class="grid">
+            <div class="card">
+              <h2>已安装工具</h2>
+              <div id="toolMgmtList" class="box">连接后加载…</div>
+            </div>
+            <div class="card">
+              <h2>导入 / 移除工具</h2>
+              <div class="row">
+                <button id="btnToolPick">选择工具源目录并导入</button>
+                <button class="outline" id="btnToolRefresh">刷新工具列表</button>
+              </div>
+              <label>工具（kind:"tool"）是无 UI 的进程实体，供其他插件经 tool 桥 load/call/subscribe 调用。</label>
+              <pre id="toolMgmtLog">…</pre>
+            </div>
           </div>
         </div>
       </section>
