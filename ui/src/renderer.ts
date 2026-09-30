@@ -261,6 +261,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       // 插件登记：它想接收来自某 toolId 的事件（宿主按 source 转发给该 iframe）。
       if (d.type === "oct.tool.subscribe") {
         const pid = pidOfFrame(ev.source);
+        console.warn(`[toolSub] subscribe toolId=${d.toolId} pid=${pid || "(未识别)"}`);
         if (pid && d.toolId) {
           if (!toolSubs.has(d.toolId)) toolSubs.set(d.toolId, new Set());
           toolSubs.get(d.toolId)!.add(pid);
@@ -292,8 +293,13 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     function forwardToPlugin(pid: string, obj: any) {
       try {
         const fr: any = document.querySelector(`iframe[data-plugin="${pid}"]`);
-        if (fr && fr.contentWindow) fr.contentWindow.postMessage(obj, "*" as any);
-      } catch (e) { /* 忽略 */ }
+        if (fr && fr.contentWindow) {
+          fr.contentWindow.postMessage(obj, "*" as any);
+          console.warn(`[forwardToPlugin] → ${pid} ok`);
+        } else {
+          console.warn(`[forwardToPlugin] → ${pid} iframe 不存在或无 contentWindow`);
+        }
+      } catch (e) { console.warn(`[forwardToPlugin] → ${pid} err ${e}`); }
     }
 
     // ── 阶段1 · 「添加插件」管理面板 ──
@@ -1204,7 +1210,8 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     ipcRenderer.on("kernel:event", (e, raw) => {
       let t;
       try { t = JSON.parse(raw); } catch { console.log("event:", raw); return; }
-      if (t.method !== "event") { console.log("event:", raw); return; }
+      // 内核自产事件 method="event"；插件进程经 event.emit 上报的事件 method="event.emit"。两者都需处理。
+      if (t.method !== "event" && t.method !== "event.emit") { console.log("event:", raw); return; }
       const p = t.params || {};
       console.log(`[event] ${p.source}:${p.type}`, p.data);
       // 内核进程状态事件：仅刷新圆点（颜色只信内核 State，不做乐观猜测）。
@@ -1216,12 +1223,14 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       // 跳过 cursor 高频帧（放大镜画面由宿主直接投给 overlay 窗渲染），只把业务/收尾事件送插件页。
       if (p.source && p.source !== "kernel") {
         const pids = toolSubs.get(p.source);
-        if (pids && pids.size) {
-          let inner = p.data;
-          if (typeof inner === "string") { try { inner = JSON.parse(inner); } catch (e) { inner = null; } }
-          if (!(inner && inner.type === "cursor")) {
-            pids.forEach((pid) => forwardToPlugin(pid, { type: "oct:tool:event", source: p.source, dataType: p.type, data: p.data }));
-          }
+        let inner = p.data;
+        if (typeof inner === "string") { try { inner = JSON.parse(inner); } catch (e) { inner = null; } }
+        const isCursor = !!(inner && inner.type === "cursor");
+        if (!isCursor) {
+          console.warn(`[toolEvt] source=${p.source} type=${p.type} inner=${inner && inner.type} subs=${pids ? pids.size : 0}`);
+        }
+        if (pids && pids.size && !isCursor) {
+          pids.forEach((pid) => forwardToPlugin(pid, { type: "oct:tool:event", source: p.source, dataType: p.type, data: p.data }));
         }
       }
     });

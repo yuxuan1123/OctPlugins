@@ -234,6 +234,10 @@ function createWindow() {
   const emitState = () => { try { win.webContents.send("win:state", win.isMaximized() ? "max" : "normal"); } catch (e) {} };
   win.on("maximize", emitState);
   win.on("unmaximize", emitState);
+  // 把 renderer 侧 console 捕获到终端，无需手动开 DevTools 即可诊断事件链。
+  win.webContents.on("console-message", (event, level, message) => {
+    console.log(`[RENDERER-CONSOLE] ${message}`);
+  });
   // 等 renderer 完成加载后再启动链路，避免 send 早于监听而丢失
   win.webContents.on("did-finish-load", () => {
     if (win._booted) return;
