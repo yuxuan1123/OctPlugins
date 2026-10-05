@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proxy 节点选择器 · 视觉预览</title>
+  <link rel="stylesheet" href="node-picker.css">
+</head>
+<body>
+  <main class="picker-shell">
+    <header class="picker-header">
+      <div class="heading-copy">
+        <span class="eyebrow">MIHOMO / 节点选择</span>
+        <h1>节点选择 · 节点选择示例</h1>
+        <p>点击卡片操作区即可切换节点；测试完成后展示并保存延迟。</p>
+      </div>
+      <span class="connection-pill ready">已连接 Mihomo</span>
+    </header>
+
+    <section class="toolbar" aria-label="节点筛选与测速">
+      <label class="search-field"><span class="sr-only">筛选节点</span><input type="search" placeholder="筛选节点名称或类型"></label>
+      <label class="url-field"><span class="sr-only">测速地址</span><input type="url" value="https://www.gstatic.com/generate_204" aria-label="测速 URL"></label>
+      <button class="button primary" type="button">测速全部</button>
+      <button class="button ghost" type="button">刷新</button>
+    </section>
+
+    <div class="status-line good" role="status">当前节点：日本 · 东京专线 02</div>
+    <section class="node-list" aria-label="节点网格">
+      <article class="node-row current">
+        <div class="node-main">
+          <div class="node-name-wrap"><span class="node-name" title="日本 · 东京专线 02">日本 · 东京专线 02</span><span class="current-mark">当前使用</span></div>
+          <span class="type-badge">Shadowsocks</span>
+        </div>
+        <span class="node-delay good">42 ms<span class="tested-at">测试于 17:02</span></span>
+        <button class="node-action active" type="button" disabled>当前使用</button>
+      </article>
+
+      <article class="node-row">
+        <div class="node-main">
+          <div class="node-name-wrap"><span class="node-name" title="新加坡 IEPL 专线 · 低延迟节点 04">新加坡 IEPL 专线 · 低延迟节点 04</span></div>
+          <span class="type-badge">VLESS · Reality</span>
+        </div>
+        <span class="node-delay good">113 ms<span class="tested-at">测试于 16:58</span></span>
+        <button class="node-action" type="button">切换到此节点</button>
+      </article>
+
+      <article class="node-row">
+        <div class="node-main">
+          <div class="node-name-wrap"><span class="node-name" title="中国香港 · 超长节点名称用于展示截断效果 · BGP 多线">中国香港 · 超长节点名称用于展示截断效果 · BGP 多线</span></div>
+          <span class="type-badge">Trojan</span>
+        </div>
+        <span class="node-delay">未测速</span>
+        <button class="node-action" type="button">切换到此节点</button>
+      </article>
+
+      <article class="node-row">
+        <div class="node-main">
+          <div class="node-name-wrap"><span class="node-name" title="美国 · 洛杉矶节点 01">美国 · 洛杉矶节点 01</span></div>
+          <span class="type-badge">VMess</span>
+        </div>
+        <span class="node-delay fail">测试失败<span class="tested-at">测试于 16:51</span></span>
+        <button class="node-action" type="button">切换到此节点</button>
+      </article>
+
+      <article class="node-row">
+        <div class="node-main">
+          <div class="node-name-wrap"><span class="node-name" title="DIRECT">DIRECT</span></div>
+          <span class="type-badge">Direct</span>
+        </div>
+        <span class="node-delay">不可测速</span>
+        <button class="node-action" type="button">切换到此节点</button>
+      </article>
+    </section>
+    <footer class="picker-footer"><span>预览示例数据，不代表实际节点或测速结果；运行时由 Mihomo 实时提供。</span><span>default.yaml</span></footer>
+  </main>
+</body>
+</html>

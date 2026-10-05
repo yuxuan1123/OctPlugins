@@ -122,10 +122,16 @@ type Manager struct {
 	onSpawn    func(*Plugin)                                                   // 注入 Event 广播出口（内核装配）
 	onState    func(id, state string)                                          // 进程状态变更回调（内核装配→宿主刷新 UI）
 	onDepsProg  func(id, phase string)                                          // §6.4：依赖安装进度回调（内核装配→宿主广播）
+	onModelEvt  func(typ string, data any)                                     // 转化域 §12.5：模型 handover 事件（内核装配→宿主广播）
+	pinsFn      func() map[string]string                                       // 转化域 §8.1：用户能力级 pin 读取器（装配根注入）
+	pinWriteFn  func(capability, modelID string) error                         // 转化域 §8.1：pin 写入器（装配根注入，落 user-settings.json）
+	settingsGetFn func(pluginID string, mf Manifest) (map[string]any, error)                 // §17.2 A：插件读自己的生效设置（装配根注入）
+	settingsSetFn func(pluginID string, mf Manifest, settings map[string]any) error        // §17.2 A：插件写自己的设置（装配根注入）
 	tokenGen   func() string                                                   // §11.4：每次 spawn 一次性生成握手 token（默认 crypto/rand hex）
 
 	resources *resources.Manager // §14 ResourceMap（extern deps 登记/获取/释放）
 	toolsRoot string             // §14.2 tools/ 根（bundled 定位用）
+	modelsRoot string            // 转化域 §20.5：模型存储根（空 = DefaultModelsRoot）
 
 	patrolOnce sync.Once // §12.2.3：健康巡检单 goroutine（全插件共享），once 防重复启动
 
@@ -197,6 +203,24 @@ func (m *Manager) SetOnDepsProgress(fn func(id, phase string)) {
 	m.mu.Lock()
 	m.onDepsProg = fn
 	m.mu.Unlock()
+}
+
+// SetOnModelEvent 注入模型 handover 事件回调（转化域 §12.5：全程对用户可见）。
+// 内核装配时接到 ws 广播（source=kernel，type=models.handover.*）。
+func (m *Manager) SetOnModelEvent(fn func(typ string, data any)) {
+	m.mu.Lock()
+	m.onModelEvt = fn
+	m.mu.Unlock()
+}
+
+// emitModelEvent 向宿主广播一条模型事件；未注入回调时静默丢弃（不影响编排）。
+func (m *Manager) emitModelEvent(typ string, data any) {
+	m.mu.Lock()
+	fn := m.onModelEvt
+	m.mu.Unlock()
+	if fn != nil {
+		fn(typ, data)
+	}
 }
 
 // SetOnSpawn 设置插件启动后的钩子（内核用它注入 Event 广播出口）。
@@ -649,6 +673,12 @@ func (m *Manager) tamperCheck(mf Manifest) error {
 
 // register 以 manifest 创建登记项并声明权限。返回已有登记（幂等）。
 func (m *Manager) register(mf Manifest) *reg {
+	// 转化域 §23：manifest 契约校验（spawn 白名单 / net 与权限一致性）。
+	// 自相矛盾的声明 MUST 拒绝登记，而不是留到运行期才暴露。
+	if err := validateManifestContract(mf); err != nil {
+		log.Printf("[scan] %s: %v", mf.ID, err)
+		return nil
+	}
 	// 合并用户覆盖（override 优先于 manifest 默认值）
 	mf.LifecyclePolicy = m.OverrideFor(mf.ID).apply(mf.LifecyclePolicy)
 	if m.gate != nil {
@@ -670,6 +700,8 @@ func (m *Manager) register(mf Manifest) *reg {
 	m.mu.Unlock()
 	m.registerResourceDeps(mf)                 // §14：externalDependencies → ResourceMap 登记
 	m.syncRegistryEntry(mf.ID, mf.Version, mf) // §8：登记即记入 registry.json（唯一写入方）
+	m.registerProvidedModels(mf)               // 转化域 §三：providesModels → registry.json.models
+	m.RegisterFunctions(mf)                    // §11.6：扫描期即注册共享函数，lazy tool 亦可被 registry.call 唤起（GetOrStart 兜底）
 	return local
 }
 
@@ -987,6 +1019,10 @@ func (m *Manager) loopSpawn(r *reg) (*Plugin, error) {
 	if err := m.tamperCheck(r.mf); err != nil {
 		return nil, fmt.Errorf("tamper check %s: %w", r.id, err)
 	}
+	// 转化域 §20.4：原生共享库校验（lockHash 锁不住 .dll/.so；不匹配拒绝派生进程）。
+	if err := verifyNativeLibs(r.mf); err != nil {
+		return nil, fmt.Errorf("native libs %s: %w", r.id, err)
+	}
 	// §10.2 ③ EnsureDeps：求 jsonHash/lockHash/cacheDir 并写入 registry（§6/§8）。
 	if err := m.recordDeps(r.mf); err != nil {
 		return nil, fmt.Errorf("ensure deps %s: %w", r.id, err)
@@ -1245,6 +1281,7 @@ func (m *Manager) loopStop(ev *stEvent) error {
 	r.mu.Unlock()
 	if ev.remove {
 		m.UnregisterFunctions(ev.id)
+		m.unregisterProvidedModels(ev.id) // 转化域 §三：卸载收回该 tool 的模型声明
 		m.mu.Lock()
 		delete(m.regs, ev.id)
 		m.mu.Unlock()

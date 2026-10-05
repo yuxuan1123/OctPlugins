@@ -52,9 +52,29 @@ func TestManifestStrictDecode_RejectsUnknown(t *testing.T) {
 	}
 }
 
+func TestMVPTestProxyManifestStrictDecode(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "mvp_test", "proxy", "manifest.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read mvp_test proxy manifest: %v", err)
+	}
+	mf, err := decodeManifest(b)
+	if err != nil {
+		t.Fatalf("mvp_test proxy manifest must match host schema: %v", err)
+	}
+	if mf.ID != "proxy" || mf.Limits.RequestTimeoutMs != 180000 {
+		t.Errorf("manifest id/request timeout = %q/%d, want proxy/180000", mf.ID, mf.Limits.RequestTimeoutMs)
+	}
+	mf.LifecyclePolicy.ApplyDefaults()
+	if err := mf.LifecyclePolicy.Validate(); err != nil {
+		t.Fatalf("mvp_test proxy lifecycle policy must be valid: %v", err)
+	}
+}
+
 func TestManifestRead_RealPluginDirs(t *testing.T) {
 	// 对真实插件目录做严格解析，确保开启 DisallowUnknownFields 后现网插件仍可装载。
-	root := filepath.Join("..", "..", "plugins")
+	// 测试 cwd = 包目录（kernel/internal/lifecycle），仓库根在其上三级。
+	root := filepath.Join("..", "..", "..", "plugins")
 	dirs, err := os.ReadDir(root)
 	if err != nil {
 		t.Skipf("plugins dir not found (%v); skipping integration", err)
@@ -63,7 +83,7 @@ func TestManifestRead_RealPluginDirs(t *testing.T) {
 		if !d.IsDir() || strings.HasPrefix(d.Name(), "_") {
 			continue
 		}
-		mf, err := readManifest(filepath.Join("..", ".."), d.Name())
+		mf, err := readManifest(filepath.Join("..", "..", "..", "plugins"), d.Name())
 		if err != nil {
 			t.Errorf("real manifest %s must parse strictly: %v", d.Name(), err)
 			continue

@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-// 权限位定义（FR-7 至少要求这六项）。
+// 权限位定义（FR-7 至少要求这六项 + translate.md §5.5 隐私维度两项）。
 const (
 	FileRead       = "file_read"
 	FileWrite      = "file_write"
@@ -21,9 +21,11 @@ const (
 	ExecuteCommand = "execute_command"
 	LocalModel     = "local_model"
 	SpawnProcess   = "spawn_process"
+	Screen         = "screen" // 隐私维度：屏幕区域采集授权（区域级，非全屏）
+	Mic            = "mic"    // 隐私维度：麦克风录音授权
 )
 
-var All = []string{FileRead, FileWrite, Network, ExecuteCommand, LocalModel, SpawnProcess}
+var All = []string{FileRead, FileWrite, Network, ExecuteCommand, LocalModel, SpawnProcess, Screen, Mic}
 
 var ErrNotGranted = errors.New("permission not granted")
 
@@ -146,6 +148,17 @@ func (g *Gate) Check(pluginID, perm string) error {
 	defer g.mu.Unlock()
 	if g.grants[pluginID] == nil || !g.grants[pluginID][perm] {
 		return ErrNotGranted
+	}
+	return nil
+}
+
+// CheckDeclared 校验权限位是否在插件 manifest 中声明（gate.perm_assert 的前置门槛，
+// 防插件试探未声明的高敏权限；declared 由启动扫描按 manifest permissions 装载）。
+func (g *Gate) CheckDeclared(pluginID, perm string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if perm == "" || g.declared[pluginID] == nil || !g.declared[pluginID][perm] {
+		return errors.New("perm not declared in manifest")
 	}
 	return nil
 }

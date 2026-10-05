@@ -184,10 +184,20 @@
     .lc-bo { justify-content:center; }
     .lc-bo label { display:flex; align-items:center; gap:8px; color:var(--ink); font-size:12px; cursor:pointer; }
     /* 单插件选择：搜索下拉组合框 */
-    .lc-pick { display:flex; flex-direction:column; gap:8px; margin:12px 0 2px; }
+    .lc-pick { display:flex; flex-direction:column; gap:8px; margin:12px 0 2px; position:relative; }
     .lc-pick input { width:100%; background:rgba(255,252,245,.5); border:1px solid var(--line);
       border-radius:10px; padding:9px 12px; color:var(--ink); font-size:13px; font-family:inherit; }
     .lc-pick input:focus { outline:none; border-color:var(--ink-soft); }
+    /* 自绘下拉：命中项排前加粗，未命中项仍全部展示（置灰） */
+    .lc-drop { position:absolute; top:calc(100% + 4px); left:0; right:0; z-index:20;
+      max-height:260px; overflow-y:auto; background:var(--paper-2);
+      border:1px solid var(--card-line); border-radius:10px; box-shadow:var(--shadow); }
+    .lc-dd-item { padding:8px 12px; font-size:13px; color:var(--ink); cursor:pointer;
+      border-bottom:1px solid var(--card-line); }
+    .lc-dd-item:last-child { border-bottom:none; }
+    .lc-dd-item:hover, .lc-dd-item.cur { background:rgba(178,58,48,.10); color:var(--cinnabar); }
+    .lc-dd-item.hit { font-weight:700; color:var(--ink); }
+    .lc-dd-item:not(.hit) { color:var(--ink-faint); }
 
     /* ── 命令面板（阶段D，FR-9） ── */
     #palette { position:fixed; inset:0; z-index:100; display:none;
@@ -296,7 +306,7 @@
           <div class="sett-row"><span class="sett-name">启动与资源 · 单插件策略</span><button class="sett-btn" data-sec="C">设置</button></div>
           <div class="sett-row"><span class="sett-name">插件排序 · 默认页</span><button class="sett-btn" data-sec="D">设置</button></div>
           <div class="sett-row"><span class="sett-name">插件列表</span><button class="sett-btn" data-sec="E">设置</button></div>
-          <div class="sett-row"><span class="sett-name">插件内部设置</span><button class="sett-btn" data-sec="F">设置</button></div>
+          <div class="sett-row"><span class="sett-name">插件/tool内部设置</span><button class="sett-btn" data-sec="F">设置</button></div>
           <div class="sett-row"><span class="sett-name">插件依赖（隔离环境）</span><button class="sett-btn" data-sec="G">设置</button></div>
           <div class="sett-row"><span class="sett-name">已安装库及版本</span><button class="sett-btn" data-sec="H">设置</button></div>
           <div class="sett-row"><span class="sett-name">共享函数</span><button class="sett-btn" data-sec="I">设置</button></div>
@@ -336,6 +346,7 @@
             <h2>启动与资源 · 全局策略</h2>
             <div class="lc-toggle"><input id="gRecycle" type="checkbox"><span>启用空闲回收（非 `always` 插件空闲后回收）</span></div>
             <div class="lc-toggle"><input id="gRestart" type="checkbox"><span>启用崩溃自动重启（指数退避 + 窗口限次）</span></div>
+            <div class="lc-toggle"><input id="gPreload" type="checkbox" checked><span>开机预加载默认模型（ocr / stt / tts / translate 等能力的首个模型）</span></div>
             <div class="row" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
               <div class="lc-num"><span>空闲阈值（分钟）</span><input id="gIdleMin" type="number" min="1" step="1" placeholder="5"></div>
               <div class="lc-num"><span>每插件内存上限（MB，0=不限）</span><input id="gMemM" type="number" min="0" step="64" placeholder="0"></div>
@@ -350,8 +361,8 @@
           <div class="card" data-sec="C">
             <h2>启动与资源 · 单插件策略</h2>
             <div class="lc-pick">
-              <input id="lcPick" type="text" list="lcPlugins" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
-              <datalist id="lcPlugins"></datalist>
+              <input id="lcPick" type="text" placeholder="搜索并选择插件名称或 ID…" autocomplete="off" spellcheck="false">
+              <div id="lcDrop" class="lc-drop" hidden></div>
             </div>
             <button class="mini" id="btnLcRefresh" style="margin-top:8px">刷新</button>
             <div id="lcPerPluginBox"></div>
@@ -362,8 +373,8 @@
             <pre id="list">…</pre>
           </div>
           <div class="card" data-sec="F">
-            <h2>插件内部设置</h2>
-            <p style="font-size:12px;color:var(--ink-soft)">由插件 <b>manifest.json</b> 的 <code>settingsSchema</code>（JSON Schema）驱动。仅保存 schema 覆盖的字段（§17.2 A），非 schema 字段不会被写入，新增字段无需改宿主代码。选择插件后在此编辑其内部设置。</p>
+            <h2>插件/tool内部设置</h2>
+            <p style="font-size:12px;color:var(--ink-soft)">由插件/tool <b>manifest.json</b> 的 <code>settingsSchema</code>（JSON Schema）驱动。仅保存 schema 覆盖的字段（§17.2 A），非 schema 字段不会被写入，新增字段无需改宿主代码。选择插件/tool 后在此编辑其内部设置。</p>
             <div class="lc-pick">
               <input id="psPick" type="text" list="psPlugins" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
               <datalist id="psPlugins"></datalist>

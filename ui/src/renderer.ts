@@ -21,7 +21,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     if (IS_SETTINGS) {
       const SEC = QP.get("sec");
       document.body.classList.add("settings-window");
-      const names = { A: "依赖源设置", B: "启动与资源·全局策略", C: "启动与资源·单插件策略", D: "插件排序·默认页", E: "插件列表", F: "插件内部设置", G: "插件依赖（隔离环境）", H: "已安装库及版本", I: "共享函数", K: "外部地址与内存设置", L: "热键（快捷键）" };
+      const names = { A: "依赖源设置", B: "启动与资源·全局策略", C: "启动与资源·单插件策略", D: "插件排序·默认页", E: "插件列表", F: "插件/tool内部设置", G: "插件依赖（隔离环境）", H: "已安装库及版本", I: "共享函数", K: "外部地址与内存设置", L: "热键（快捷键）" };
       const titleEl = document.getElementById("settTitle");
       if (titleEl) titleEl.textContent = "设置 · " + (names[SEC] || SEC || "");
       // 只亮出当前 sec 的卡片，其余表单隐藏（DOM 全部保留，供各加载函数引用不报错）
@@ -35,6 +35,9 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       };
       // 主窗的 kernel:ready 只发给主窗，子窗口收不到；改用宿主 rpc 桥自行填充各设置表单
       queueMicrotask(() => {
+        // 先读 user-settings.json 再同步依赖它的控件（gPreload），且保证后续 saveUIPrefs 基于已加载的 uiPrefs，
+        // 否则子窗口里保存会用默认值覆盖整个 ui 节（曾把 sidebarOrder 清空）。
+        if (typeof loadUIPrefs === "function") loadUIPrefs().then(() => { const gp = $("gPreload"); if (gp) gp.checked = uiPrefs.preloadModels !== false; });
         if (typeof loadDepCfg === "function") loadDepCfg();
         if (typeof refreshOrderSettings === "function") refreshOrderSettings();
         if (typeof refreshMgmt === "function") refreshMgmt();
@@ -86,17 +89,18 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     }
     // ── 侧栏排序 + 默认页（宿主级 UI 设置，落 user-settings.json -> ui，§17.2 B；去 localStorage） ──
     // uiPrefs 为内核 user-settings.json 的 ui 节镜像缓存（同步读友好），经 ui.getSettings/ui.setSettings 同步。
-    let uiPrefs: { sidebarOrder: string[]; defaultPage: string } = { sidebarOrder: [], defaultPage: "home" };
+    let uiPrefs: { sidebarOrder: string[]; defaultPage: string; preloadModels?: boolean } = { sidebarOrder: [], defaultPage: "home", preloadModels: true };
     async function loadUIPrefs() {
       try {
         const r = await rpc("ui.getSettings", {});
         const u = (r && r.ui) || {};
         if (Array.isArray(u.sidebarOrder)) uiPrefs.sidebarOrder = u.sidebarOrder;
         if (typeof u.defaultPage === "string") uiPrefs.defaultPage = u.defaultPage;
+        if (typeof u.preloadModels === "boolean") uiPrefs.preloadModels = u.preloadModels;
       } catch { /* 内核未就绪时保持默认 */ }
       return uiPrefs;
     }
-    async function saveUIPrefs(delta: { sidebarOrder?: string[]; defaultPage?: string }) {
+    async function saveUIPrefs(delta: { sidebarOrder?: string[]; defaultPage?: string; preloadModels?: boolean }) {
       uiPrefs = { ...uiPrefs, ...delta }; // 乐观更新：先应用
       try { await rpc("ui.setSettings", { ui: uiPrefs }); } catch { /* 落盘失败不阻断本次应用 */ }
       return uiPrefs;
@@ -229,7 +233,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
         });
         return;
       }
-      // 插件请求原生文件/目录对话框：action = 'openFile'|'pickDir'，带 reqId 回调
+      // 插件请求原生文件/目录对话框：action = 'pickFile'|'pickDir'|'saveFile'，带 reqId 回调
       if (d.type === "oct.dialog" && d.action) {
         if (ev.origin && KERNEL_BASE && !("" + ev.origin).includes("127.0.0.1")) return;
         (async () => {
@@ -237,6 +241,8 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
           try {
             if (d.action === "pickFile") {
               r = await ipcRenderer.invoke("dialog:pickFile", d.filters || []);
+            } else if (d.action === "saveFile") {
+              r = await ipcRenderer.invoke("dialog:saveFile", { filters: d.filters || [], defaultPath: d.defaultPath || "" });
             } else {
               r = await ipcRenderer.invoke("dialog:pickDir");
             }
@@ -277,10 +283,12 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       if (d.type === "oct.overlay") {
         if (ev.origin && KERNEL_BASE && !("" + ev.origin).includes("127.0.0.1")) return;
         const pluginId = d.pluginId, toolId = d.toolId;
-        if (d.action === "open" && pluginId) ipcRenderer.invoke("overlay:open", { pluginId, toolId });
+        if (d.action === "open" && pluginId) ipcRenderer.invoke("overlay:open", { pluginId, toolId, interactive: !!d.interactive, persistent: !!d.persistent });
         else if (d.action === "close" && pluginId) ipcRenderer.invoke("overlay:close", { pluginId });
         return;
       }
+      // §27 文件关联：conversion 页确认收到文件注入 → 停止重试。
+      if (d.type === "oct:convertFile:ack" && d.reqId) { faAcked.add(d.reqId); return; }
     });
     // toolId → 订阅它的插件 iframe id 集合（宿主据此把 tool 事件转发给对应插件页）。
     const toolSubs: Map<string, Set<string>> = new Map();
@@ -300,6 +308,45 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
           console.warn(`[forwardToPlugin] → ${pid} iframe 不存在或无 contentWindow`);
         }
       } catch (e) { console.warn(`[forwardToPlugin] → ${pid} err ${e}`); }
+    }
+
+    // ── §27 文件关联：宿主「打开方式」收到文件 → 切到 conversion 面板并注入文件 ──
+    // 该页随即列出可达目标格式（conversion.md §27）。iframe 首次加载需数秒（懒启动），
+    // 故周期性注入直至页面 ack；页面重复收到同路径会自行去重。
+    const faAcked = new Set<string>();
+    function openConversionWithFile(p: string) {
+      switchPanel("plugin.conversion");
+      const btn: any = document.querySelector('button[data-plugin-id="conversion"]');
+      if (btn && !btn.classList.contains("running") && !btn.classList.contains("disabled")) {
+        paintDot(btn, "STARTING");
+        rpc("plugin.start", { pluginId: "conversion" }, 120000).catch(() => {});
+      }
+      const frame: any = document.querySelector('iframe[data-plugin="conversion"]');
+      if (!frame) return;
+      ensurePluginFrame("conversion"); // 首次打开才设 src 加载
+      const reqId = "fa" + Date.now();
+      const tryInject = (tries: number) => {
+        if (!frame.isConnected) return;
+        if (faAcked.has(reqId)) { faAcked.delete(reqId); return; } // 页面已确认
+        const w: any = frame.contentWindow;
+        if (w && frame.getAttribute("src") && frame.src !== "about:blank") {
+          try { w.postMessage({ type: "oct:convertFile", path: p, reqId }, "*" as any); } catch (e) { /* 忽略 */ }
+        }
+        if (tries < 40) setTimeout(() => tryInject(tries + 1), 400); // ≤16s 等页面加载与握手
+      };
+      tryInject(0);
+    }
+    let panelsReady = false; // renderPlugins 完成（面板可注入）后再处理打开请求
+    let pendingFileToOpen = "";
+    ipcRenderer.on("file:open", (e, { path: filePath }: any = {}) => {
+      if (!filePath) return;
+      if (panelsReady) openConversionWithFile(filePath);
+      else pendingFileToOpen = filePath; // kernel:ready 异步装配中，稍后补投
+    });
+    function flushPendingFile() {
+      if (!panelsReady || !pendingFileToOpen) return;
+      const p = pendingFileToOpen; pendingFileToOpen = "";
+      openConversionWithFile(p);
     }
 
     // ── 阶段1 · 「添加插件」管理面板 ──
@@ -479,16 +526,22 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     }
     // 设置面板·单插件策略列表：每个插件一行汇总（模式/回收/重启/状态），点「编辑」展开编辑器
     const LC_INDEX: any = {}; // 插件显示名 -> id，供输入框解析
+    // 选项文案：名称本身已含「（id）」时（如 能力网关（capability-gateway））不再重复追加 id，避免英文出现两遍
+    function pluginLabel(p: any): string {
+      const name = p.name || p.pluginId || "";
+      if (name.includes(p.pluginId)) return name;
+      return `${name}（${p.pluginId}）`;
+    }
     async function loadPerPluginList(preserveSel = undefined) {
-      const input = $("lcPick"), dl = $("lcPlugins");
+      const input = $("lcPick");
       if (!input) return;
       try {
         const list = (await rpc("plugin.list", {})).plugins || [];
         LC_INDEX.__all = list;
-        dl.innerHTML = list.map(p => `<option value="${p.name || p.pluginId}（${p.pluginId}）"></option>`).join("");
+        refreshLcDrop();
         // 保留之前选中
         if (preserveSel && input._sel) renderSinglePlugin(input._sel);
-      } catch (e) { dl.innerHTML = ""; }
+      } catch (e) { refreshLcDrop(); }
     }
     // 输入框解析：支持「名称（id）」「id」「部分名称/id 前缀»，返回命中插件或 null
     function resolveLC(raw) {
@@ -525,18 +578,109 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       box.innerHTML = summary + `<div id="lceeds-sel"></div>`;
       await toggleLifecycleEditor(id, $("lceeds-sel"), true); // 选中即强制渲染表单
     }
-    // 组合框交互：输入联想（blur 解析、回车解析、datalist 由浏览器原生提供）
+    // 自绘下拉（替代原生 datalist）：输入后命中的选项排在最前，其余全部照常展示（置灰），
+    // 避免原生 datalist 过滤掉未命中项导致找不到其他插件。
+    // 展开时机：仅输入框获得焦点时才展开（打开窗口/刷新列表不主动弹出）；
+    // 收回时机：鼠标脱离组合框（输入框+选项框）2s 自动收回。
+    let lcDropTimer: number | undefined;
+    function clearLcDropTimer() {
+      if (lcDropTimer) { clearTimeout(lcDropTimer); lcDropTimer = undefined; }
+    }
+    function armLcAutoClose() {
+      const dd = $("lcDrop");
+      if (!dd || dd.hidden) return;
+      clearLcDropTimer();
+      lcDropTimer = window.setTimeout(() => {
+        lcDropTimer = undefined;
+        const d = $("lcDrop");
+        if (d) d.hidden = true;
+      }, 2000);
+    }
+    function refreshLcDrop() {
+      const input = $("lcPick"), dd = $("lcDrop");
+      if (!input || !dd) return;
+      const all = LC_INDEX.__all || [];
+      const q = (input.value || "").trim().toLowerCase();
+      const hit: any[] = [], rest: any[] = [];
+      for (const p of all) {
+        const label = pluginLabel(p).toLowerCase();
+        const id = (p.pluginId || "").toLowerCase();
+        if (q && !label.includes(q) && !id.includes(q)) rest.push(p);
+        else hit.push(p);
+      }
+      const items = hit.concat(rest);
+      // 仅输入框聚焦时才展开；否则保持收起（窗口打开/刷新列表不得主动弹出）
+      const show = document.activeElement === input && items.length > 0;
+      dd.hidden = !show;
+      if (!show) { clearLcDropTimer(); return; }
+      dd.innerHTML = items.map((p, i) =>
+        `<div class="lc-dd-item${q && i < hit.length ? " hit" : ""}" data-id="${p.pluginId}">${pluginLabel(p)}</div>`
+      ).join("");
+      // 鼠标不在组合框内（如键盘聚焦打开）时，立即起 2s 收回计时
+      const box = input.closest(".lc-pick") as HTMLElement | null;
+      if (box && !box.matches(":hover")) armLcAutoClose();
+    }
+    // 组合框交互：输入联想（blur 解析、回车解析、自绘下拉点击/方向键选择）
     function wirePluginPicker() {
-      const input = $("lcPick");
+      const input = $("lcPick"), dd = $("lcDrop");
+      if (!input || !dd) return;
+      let curIdx = -1;
+      const pickEl = (el: any) => {
+        const p = (LC_INDEX.__all || []).find(x => x.pluginId === el.dataset.id);
+        if (!p) return;
+        input.value = pluginLabel(p);
+        input._sel = p.pluginId;
+        dd.hidden = true;
+        curIdx = -1;
+        renderSinglePlugin(p.pluginId);
+      };
+      const moveCur = (d: number) => {
+        const els = dd.querySelectorAll(".lc-dd-item");
+        if (!els.length) return;
+        curIdx = Math.max(0, Math.min(els.length - 1, curIdx + d));
+        els.forEach((e: any, i: number) => e.classList.toggle("cur", i === curIdx));
+        const el: any = els[curIdx];
+        if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
+      };
       // 仅当解析出的插件与当前已渲染的不同时才重建表单。
       // 避免点“保存/恢复”按钮时先触发 blur → 重建整个 box 替换按钮 → 吞掉该次点击。
       const apply = () => {
         const hit = resolveLC(input.value);
         if (hit && hit.pluginId !== input._sel) renderSinglePlugin(hit.pluginId);
       };
+      // 下拉点击：用 mousedown+preventDefault 抢在 blur 之前选择，避免 blur 先重建表单吞掉点击
+      dd.addEventListener("mousedown", (ev: any) => {
+        const el = (ev.target as HTMLElement).closest(".lc-dd-item");
+        if (!el) return;
+        ev.preventDefault();
+        pickEl(el);
+      });
+      input.addEventListener("focus", () => { curIdx = -1; refreshLcDrop(); });
+      input.addEventListener("input", () => { curIdx = -1; refreshLcDrop(); });
       input.addEventListener("change", apply);
-      input.addEventListener("blur", apply);
-      input.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+      input.addEventListener("blur", () => { setTimeout(() => { dd.hidden = true; curIdx = -1; }, 120); apply(); });
+      input.addEventListener("keydown", (e: any) => {
+        if (e.key === "ArrowDown") { if (!dd.hidden) { e.preventDefault(); moveCur(1); } return; }
+        if (e.key === "ArrowUp") { if (!dd.hidden) { e.preventDefault(); moveCur(-1); } return; }
+        if (e.key === "Enter") {
+          if (!dd.hidden && curIdx >= 0) {
+            const el = dd.querySelectorAll(".lc-dd-item")[curIdx];
+            if (el) { e.preventDefault(); pickEl(el); return; }
+          }
+          apply();
+          return;
+        }
+        if (e.key === "Escape") { dd.hidden = true; curIdx = -1; return; }
+      });
+      document.addEventListener("click", (ev: any) => {
+        if (!dd.hidden && !(ev.target as HTMLElement).closest(".lc-pick")) { dd.hidden = true; curIdx = -1; }
+      });
+      // 鼠标脱离组合框（输入框+选项框）2s 自动收回；回到框内即取消计时
+      const box = input.closest(".lc-pick") as HTMLElement | null;
+      if (box) {
+        box.addEventListener("mouseenter", clearLcDropTimer);
+        box.addEventListener("mouseleave", armLcAutoClose);
+      }
     }
     // 全局预设：把 load_mode 批量应用到所有插件（保留用户对某个插件已设的其他覆盖）
     async function applyGlobalPreset(mode, opts) {
@@ -629,6 +773,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       KERNEL_BASE = kernelBase; OCT_CONN = { port, token };
       $("list").textContent = JSON.stringify(list, null, 2);
       await loadUIPrefs(); // §17.2 B：先读取 user-settings.json 的侧栏顺序/默认页再渲染
+      if ($("gPreload")) $("gPreload").checked = uiPrefs.preloadModels !== false;
       renderPlugins(list && list.plugins || []);
       loadDepCfg();
       refreshFns();
@@ -639,6 +784,13 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       openDefaultPlugin(); // 启动后默认打开用户在设置中指定的插件页（默认 home）
       refreshOrderSettings(); // 填充「插件排序 · 默认页」配置卡片
       loadHotkeyCache();      // 阶段L：缓存热键表（app 作用域热键由渲染进程派发）
+      panelsReady = true;     // §27：面板已装配，补投启动早期经「打开方式」收到的文件
+      flushPendingFile();
+    });
+
+    // 开机预加载默认模型开关：变更即落盘到 user-settings.json
+    if ($("gPreload")) $("gPreload").addEventListener("change", async (e: any) => {
+      await saveUIPrefs({ preloadModels: !!e.target.checked });
     });
 
     async function loadDepCfg() {
@@ -786,12 +938,12 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       if (!input) return false;
       if (!$("depPlugins").innerHTML) {
         const all = LC_INDEX.__all || [];
-        dl.innerHTML = all.map(p => `<option value="${p.name || p.pluginId}（${p.pluginId}）"></option>`).join("");
+        dl.innerHTML = all.map(p => `<option value="${pluginLabel(p)}"></option>`).join("");
       }
       return true;
     }
 
-    // ── §17.2 A · 插件内部设置页（settingsSchema 驱动，非 schema 字段不得写入） ──
+    // ── §17.2 A · 插件/tool内部设置页（settingsSchema 驱动，非 schema 字段不得写入） ──
     // 表单由 manifest.settingsSchema.properties 派生：string/number/integer/boolean/enum → 对应控件。
     // 值默认取 effective.settings（user → defaults → 内置），保存时仅提交 schema 声明的键。
     async function loadPluginSettingsList() {
@@ -800,7 +952,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       try {
         const list = (await rpc("plugin.list", {})).plugins || [];
         LC_INDEX.__all = list;
-        dl.innerHTML = list.map(p => `<option value="${p.name || p.pluginId}（${p.pluginId}）"></option>`).join("");
+        dl.innerHTML = list.map(p => `<option value="${pluginLabel(p)}"></option>`).join("");
       } catch (e) { dl.innerHTML = ""; }
     }
     function schemaPropControl(key: string, prop: any, current: any) {
@@ -851,7 +1003,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       if (typeof schema === "object" && schema !== null && schema.properties) props = schema.properties;
       const keys = Object.keys(props);
       if (!keys.length) {
-        box.innerHTML = `<span class="hint">插件 <b>${pid}</b> 未在 manifest 中声明 settingsSchema，无内部设置可编辑。</span>` +
+        box.innerHTML = `<span class="hint">插件/tool <b>${pid}</b> 未在 manifest 中声明 settingsSchema，无内部设置可编辑。</span>` +
           (v.effective && v.effective.settings && Object.keys(v.effective.settings).length
             ? `<div class="box" style="margin-top:8px"><b>当前生效设置：</b><pre id="psRaw" style="font-size:12px">${JSON.stringify(v.effective.settings, null, 2)}</pre></div>` : "");
         return;

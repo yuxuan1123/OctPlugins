@@ -6,7 +6,7 @@
 export {};
 
 const { app, BrowserWindow, dialog, ipcMain, globalShortcut, Tray, Menu, nativeImage, clipboard, screen } = require("electron");
-const { spawn } = require("child_process");
+const { spawn, execFile } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -76,8 +76,15 @@ ipcMain.handle("clipboard:write", async (e, payload: any = {}) => {
 // pluginId 用于定位/关闭窗口；toolId 用于把该 tool 发来的内核事件路由到此 overlay 窗。
 ipcMain.handle("overlay:open", async (e, payload: any = {}) => {
   const pluginId = payload.pluginId;
-  const toolId = payload.toolId;
   if (!pluginId) return { ok: false, error: "缺 pluginId" };
+  return openOverlayInternal(pluginId, {
+    toolId: payload.toolId, interactive: !!payload.interactive, persistent: !!payload.persistent,
+  });
+});
+// openOverlayInternal 主进程内部复用：把某插件（kind:"overlay"）的 ui 页开成全屏透明、置顶窗口。
+// 供 ipc overlay:open 与热键专用编排（translate::realtime 先框选）共用同一条开窗路径。
+async function openOverlayInternal(pluginId: string, opts: any = {}) {
+  const toolId = opts.toolId;
   // 只允许已登记的 overlay(kind) 插件？内核清单里取 ui 入口；找不到则拒。
   let entry = "";
   try {
@@ -89,37 +96,69 @@ ipcMain.handle("overlay:open", async (e, payload: any = {}) => {
   const file = entry ? (path.isAbsolute(entry) ? entry : path.join(base, entry)) : "";
   if (!entry) return { ok: false, error: "未找到插件 ui 入口: " + pluginId };
 
-  let win = overlayWindows.get(pluginId);
-  if (win && !win.isDestroyed()) { return { ok: true }; } // 已开
+  let ovWin = overlayWindows.get(pluginId);
+  if (ovWin && !ovWin.isDestroyed()) { return { ok: true }; } // 已开
   const bounds = screen.getPrimaryDisplay().bounds;
-  win = new BrowserWindow({
+  ovWin = new BrowserWindow({
     x: bounds.x, y: bounds.y,
     width: bounds.width, height: bounds.height,
     transparent: true, frame: false, resizable: false, movable: false,
     alwaysOnTop: true, skipTaskbar: true, hasShadow: false,
-    focusable: true, enableLargerThanScreen: true,
+    focusable: false, enableLargerThanScreen: true, // 不抢焦点：避免 overlay 让宿主应用到失焦
     backgroundColor: "#00000000",
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
-  win.setAlwaysOnTop(true, "screen-saver");
-  win.setIgnoreMouseEvents(true, { forward: true }); // 全穿透：点按语义由取色 native 钩子处理
-  win.on("closed", () => {
+  ovWin.setAlwaysOnTop(true, "screen-saver");
+  // 全穿透：点按语义由取色 native 钩子处理。interactive=true（如区域拉框）时不穿透、捕获鼠标拖拽；
+  // 保持 focusable:false —— 不抢宿主应用焦点，鼠标事件仍会派发到非聚焦窗。
+  if (opts.interactive) {
+    ovWin.setIgnoreMouseEvents(false);
+  } else {
+    ovWin.setIgnoreMouseEvents(true, { forward: true });
+  }
+  // 把 overlay 窗口原点 + 光标所在屏的缩放比推给渲染进程，用于把光标虚拟坐标换算到窗口坐标。
+  const pushEnv = () => {
+    try {
+      const pt = screen.getCursorScreenPoint();
+      const disp = screen.getDisplayNearestPoint(pt);
+      const [ox, oy] = ovWin.getPosition();
+      ovWin.webContents.send("overlay:env", { x: ox, y: oy, dpr: disp.scaleFactor });
+    } catch (e) {}
+  };
+  ovWin.webContents.on("did-finish-load", pushEnv);
+  screen.on("display-metrics-changed", () => pushEnv());
+  ovWin.on("closed", () => screen.removeListener("display-metrics-changed", pushEnv));
+  ovWin.on("closed", () => {
     overlayWindows.delete(pluginId);
-    if (overlayRoute.get(toolId) === win) overlayRoute.delete(toolId);
+    if (overlayRoute.get(toolId) === ovWin) overlayRoute.delete(toolId);
   });
-  win.loadFile(file);
-  overlayWindows.set(pluginId, win);
-  if (toolId) overlayRoute.set(toolId, win);
+  // persistent=1：字幕常驻框——开窗即不关闭，页面自行在 pick(拉框) / live(常驻金边) 两阶段切换。
+  ovWin.loadFile(file, { query: { persistent: opts.persistent ? "1" : "" } });
+  overlayWindows.set(pluginId, ovWin);
+  if (toolId) overlayRoute.set(toolId, ovWin);
   return { ok: true };
-});
-// 关闭并注销 overlay 窗口。
-ipcMain.handle("overlay:close", async (e, payload: any = {}) => {
-  const pluginId = payload.pluginId;
-  const win = overlayWindows.get(pluginId);
-  if (win && !win.isDestroyed()) win.destroy();
+}
+// 关闭并注销 overlay 窗口（ipc 与主进程内部编排共用）。
+ipcMain.handle("overlay:close", async (e, payload: any = {}) => closeOverlayInternal(payload.pluginId));
+function closeOverlayInternal(pluginId: string) {
+  const ovWin = overlayWindows.get(pluginId);
+  if (ovWin && !ovWin.isDestroyed()) ovWin.destroy();
   overlayWindows.delete(pluginId);
-  overlayRoute.forEach((v, k) => { if (v === win) overlayRoute.delete(k); });
+  overlayRoute.forEach((v, k) => { if (v === ovWin) overlayRoute.delete(k); });
   return { ok: true };
+}
+// 常驻框动态穿透：capture=true 时窗口抓住鼠标（贴住金边拖动/缩放）；
+// false 时整窗鼠标穿透（forward 仍把 mousemove 投给渲染进程做贴边命中），不挡被翻译软件操作。
+ipcMain.on("overlay:set-capture", (e, capture: boolean) => {
+  const w = BrowserWindow.fromWebContents(e.sender);
+  if (w && !w.isDestroyed()) w.setIgnoreMouseEvents(!capture, { forward: !capture });
+});
+// 切换常驻框阶段：pick（拉框/微调模态）↔ live（金边常驻、动态穿透）。
+ipcMain.handle("overlay:phase", async (e, payload: any = {}) => {
+  const win = overlayWindows.get(payload.pluginId);
+  if (!win || win.isDestroyed()) return { ok: false, error: "no-overlay" };
+  try { win.webContents.send("overlay:phase", payload.phase || "pick"); return { ok: true }; }
+  catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
 });
 
 // 给宿主主进程一个可辨认的标题（任务管理器/进程列表里更容易区分）
@@ -132,22 +171,29 @@ ipcMain.handle("win:openPluginWindow", async (e, opts) => {
   if (!url || !kernelAuth) return { ok: false, error: !kernelAuth ? "内核未就绪" : "无 url" };
   const sep = url.includes("?") ? "&" : "?";
   const full = url + sep + "auth=" + encodeURIComponent(kernelAuth.token) + "&kport=" + kernelAuth.port;
+  spawnPluginWindow(full, opts);
+  return { ok: true };
+});
+
+// spawnPluginWindow 通用插件窗创建（win:openPluginWindow 与热键呈现共用）：
+// frameless 时注入 editor-preload（自绘标题栏 + octWin）。仅建窗、不做单例/登记。
+function spawnPluginWindow(full: string, opts: any) {
   const sub = new BrowserWindow({
-    width: opts.width || 960, height: opts.height || 720,
-    title: opts.title || "插件窗口", icon: APP_LOGO,
-    frame: !opts.frameless, // 自绘标题栏：frameless:true → frame:false（去掉原生标题栏）+ preload 注入
+    width: (opts && opts.width) || 960, height: (opts && opts.height) || 720,
+    title: (opts && opts.title) || "插件窗口", icon: APP_LOGO,
+    frame: !(opts && opts.frameless), // 自绘标题栏：frameless:true → frame:false（去掉原生标题栏）+ preload 注入
     autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: false, contextIsolation: true,
-      preload: opts.frameless ? require("path").join(__dirname, "editor-preload.js") : undefined,
+      preload: opts && opts.frameless ? require("path").join(__dirname, "editor-preload.js") : undefined,
     },
   });
   const emitSubState = () => { try { sub.webContents.send("win:state", sub.isMaximized() ? "max" : "normal"); } catch (e) {} };
   sub.on("maximize", emitSubState);
   sub.on("unmaximize", emitSubState);
   sub.loadURL(full);
-  return { ok: true };
-});
+  return sub;
+}
 
 // 子窗口窗口控制：自绘标题栏按钮 → 最小化 / 最大化(切换) / 关闭
 ipcMain.on("win:ctrl", (e, act) => {
@@ -190,7 +236,7 @@ ipcMain.handle("win:closeSelf", (e) => {
 // 重启应用：导入新插件后宿主通常需重建内核/刷新侧栏，直接重启最省事。
 ipcMain.handle("app:relaunch", () => {
   app.relaunch();
-  app.exit(0);
+  app.quit();
   return { ok: true };
 });
 
@@ -223,6 +269,9 @@ function createWindow() {
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
   win.loadFile("index.html");
+  // 生命周期契约：主窗销毁后立即把引用置空。所有访问点均以 `if (win)` 判活，
+  // 避免关闭阶段异步回调（内核 WS 事件等）打到已销毁窗口抛 "Object has been destroyed"。
+  win.on("closed", () => { win = null; });
   // 自绘标题栏的窗口控制
   ipcMain.on("win:minimize", () => win && win.minimize());
   ipcMain.on("win:maximize", () => {
@@ -234,10 +283,6 @@ function createWindow() {
   const emitState = () => { try { win.webContents.send("win:state", win.isMaximized() ? "max" : "normal"); } catch (e) {} };
   win.on("maximize", emitState);
   win.on("unmaximize", emitState);
-  // 把 renderer 侧 console 捕获到终端，无需手动开 DevTools 即可诊断事件链。
-  win.webContents.on("console-message", (event, level, message) => {
-    console.log(`[RENDERER-CONSOLE] ${message}`);
-  });
   // 等 renderer 完成加载后再启动链路，避免 send 早于监听而丢失
   win.webContents.on("did-finish-load", () => {
     if (win._booted) return;
@@ -252,7 +297,7 @@ function createWindow() {
 // manifest 里自己声明 auto_grant —— 那等于插件给自己发权限，perms.json 就形同虚设。
 // 名单内插件按其 manifest **声明的全部权限**放权（不越声明范围）；已授权则不重复写。
 // 想长期收回某个插件的权限，把它从这份名单里删掉再去设置页撤销。
-const FIRST_PARTY_PLUGINS = []; // 一方插件自动放权名单（本项目内置 home/demo_web，无需预授权）
+const FIRST_PARTY_PLUGINS = ["translate"]; // 一方插件自动放权名单（translate 声明 file/local_model/screen/mic）
 
 async function autoGrantFirstParty() {
   for (const pid of FIRST_PARTY_PLUGINS) {
@@ -278,15 +323,49 @@ async function bootstrap() {
     await applyHotkeys(); // 阶段L：内核连上后再注册全局热键（触发时要经 plugin.call 派发）
     await autoGrantFirstParty(); // 一方插件放权须早于首屏，避免自检显示未授权
     const list = await rpc("plugin.list", {});
-    win.webContents.send("kernel:ready", {
+    // 判活：启动链路耗时期间用户可能已关窗
+    if (win && !win.isDestroyed()) win.webContents.send("kernel:ready", {
       list,
       kernelBase: `http://127.0.0.1:${auth.port}/`,
       resBase: `http://127.0.0.1:${auth.port}/res/`,
       port: auth.port, token: auth.token,
     });
+    // §27：启动早期经「打开方式」收到的文件，内核就绪后再补发（renderer 面板此时已装配）。
+    if (pendingOpenFile) {
+      const f = pendingOpenFile; pendingOpenFile = "";
+      try { if (win && !win.isDestroyed()) win.webContents.send("file:open", { path: f }); } catch (e) { /* 忽略 */ }
+    }
+    // §7 默认模型预加载（转化域 §四：加载权在宿主）：不阻塞首屏，后台确保默认能力模型就绪。
+    // 每能力选默认最快模型（MVP：ocr=rapidocr，其余能力有模型声明后自动覆盖）。
+    preloadDefaultModels();
   } catch (e) {
     console.error("启动失败:", e);
-    win.webContents.send("kernel:error", String(e));
+    if (win && !win.isDestroyed()) win.webContents.send("kernel:error", String(e));
+  }
+}
+
+// §7.1/§7.2 默认模型预加载：宿主启动时每能力加载默认最快模型（写 EffectiveConfig 前 MVP 用
+// registry.json.models 声明驱动：每个 capability 取第一个模型 acquire 就绪登记）。
+// 失败仅降级告警，不阻塞应用启动。
+async function preloadDefaultModels() {
+  try {
+    const s = await rpc("ui.getSettings", {}, 5000);
+    const ui = (s && s.ui) || {};
+    if (ui.preloadModels === false) { console.log("[preload] 用户已关闭默认模型预加载，跳过"); return; }
+    const r = await rpc("registry.models.list", {}, 15000);
+    const models = (r && r.models) || [];
+    const byCap = new Map(); // capability → modelId（按声明顺序取第一个为默认）
+    for (const mo of models) {
+      if (!mo.capability) continue;
+      if (mo.companion) continue; // 伴随模型随主模型一起加载（§四），不单独预加载
+      if (!byCap.has(mo.capability)) byCap.set(mo.capability, mo.id);
+    }
+    for (const [cap, id] of byCap) {
+      try { await rpc("registry.models.acquire", { id }, 30000); }
+      catch (err) { console.warn(`[preload] ${cap} 默认模型 ${id} 就绪失败:`, String((err && err.message) || err)); }
+    }
+  } catch (err) {
+    console.warn("[preload] 模型预加载跳过:", String((err && err.message) || err));
   }
 }
 
@@ -311,6 +390,20 @@ ipcMain.handle("dialog:pickFile", async (e, filters) => {
   });
   if (canceled || !filePaths.length) return { canceled: true };
   return { canceled: false, path: filePaths[0] };
+});
+
+// 保存对话框：供插件指定「另存为」目标（如格式转换的输出文件）。
+// opts = { filters?: [{name,extensions}], defaultPath?: string }
+ipcMain.handle("dialog:saveFile", async (e, opts) => {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const filters = (o.filters && o.filters.length ? o.filters : null) || [{ name: "所有文件", extensions: ["*"] }];
+  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    title: o.title || "保存为",
+    defaultPath: o.defaultPath || undefined,
+    filters,
+  });
+  if (canceled || !filePath) return { canceled: true };
+  return { canceled: false, path: filePath };
 });
 
 // ── 外部地址与内存设置：扫描各插件静态 manifest（不依赖插件进程是否在线）──
@@ -366,6 +459,79 @@ ipcMain.handle("res:set", async (e, { pid, item }: any = {}) => {
     return { ok: false, error: String((err && err.message) || err) };
   }
 });
+
+// ── §27 文件关联（Windows「打开方式」） ─────────────────────────────
+// 宿主启动时向 HKCU\Software\Classes 静默注册「打开方式」项（无需管理员权限）：
+//   1) Applications\octplugin.exe → 出现在「打开方式 → 选择其他应用」；
+//   2) 每扩展名 OpenWithProgids → 直接出现在右键「打开方式」子菜单。
+// 用户右键文件 → 打开方式 → 本应用 → Windows 以「<exe> <file>」拉起 → 单实例转发
+// 文件路径给主实例 → 切 conversion 面板列出可达目标格式并允许直接转换（conversion.md §27）。
+const FA_APP = "octplugin.exe"; // Applications 子键名（与打包后 exe 文件名一致）
+const FA_PROGID = "OctPlugins.OpenWith"; // 打开方式 ProgID
+// 打开方式命令：打包后直接以应用 exe 打开；开发模式经 electron.exe + 入口脚本。
+function faEntryCommand() {
+  if (app.isPackaged) return `"${app.getPath("exe")}" "%1"`;
+  return `"${process.execPath}" "${path.join(__dirname, "main.js")}" "%1"`;
+}
+// 扫描各 tool manifest 声明的转换源格式（conversion.md §二：边由 tool 声明）。
+function faScanExtensions() {
+  const set = new Set<string>();
+  if (!fs.existsSync(PLUGINS_ROOT)) return [];
+  const dirs = fs.readdirSync(PLUGINS_ROOT, { withFileTypes: true })
+    .filter(d => d.isDirectory() && !d.name.startsWith("_") && !d.name.startsWith("."))
+    .map(d => d.name);
+  for (const pid of dirs) {
+    const mf = readJsonSafe(path.join(PLUGINS_ROOT, pid, "manifest.json"), null);
+    if (!mf || !Array.isArray(mf.conversions)) continue;
+    for (const c of mf.conversions) {
+      for (const f of c.from || []) {
+        const e = String(f).toLowerCase().replace(/^\./, "").trim();
+        if (e) set.add(e);
+      }
+    }
+  }
+  return [...set].sort();
+}
+// 单条注册（reg add，HKCU 无需提权）；失败仅记录，不阻断启动。
+function regAdd(key: string, data: string, value = "/ve"): Promise<boolean> {
+  return new Promise((res) => {
+    execFile("reg", ["add", key, value, "/d", data, "/f"], { windowsHide: true }, (err) => res(!err));
+  });
+}
+async function registerFileAssoc() {
+  const cmd = faEntryCommand();
+  const exts = faScanExtensions();
+  const failed: string[] = [];
+  if (!(await regAdd(`HKCU\\Software\\Classes\\Applications\\${FA_APP}\\shell\\open\\command`, cmd))) failed.push("Applications\\command");
+  if (!(await regAdd(`HKCU\\Software\\Classes\\${FA_PROGID}\\shell\\open\\command`, cmd))) failed.push("ProgID\\command");
+  if (!(await regAdd(`HKCU\\Software\\Classes\\${FA_PROGID}\\DefaultIcon`, `"${app.getPath("exe")}",0`))) failed.push("ProgID\\DefaultIcon");
+  for (const e of exts) {
+    if (!(await regAdd(`HKCU\\Software\\Classes\\.${e}\\OpenWithProgids\\${FA_PROGID}`, ""))) failed.push("." + e);
+  }
+  if (failed.length) console.warn("[fileassoc] 部分「打开方式」注册失败:", failed.join(", "));
+}
+// 从命令行参数提取用户经「打开方式」传入的文件路径（跳过开关、exe、入口脚本）。
+function extractOpenFile(argv: string[]): string {
+  const entry = app.isPackaged ? "" : path.resolve(path.join(__dirname, "main.js"));
+  for (const a of argv || []) {
+    if (!a || a.startsWith("-")) continue;
+    const p = path.resolve(String(a).replace(/^--/, ""));
+    if (entry && p === entry) continue;
+    if (/\.(exe|dll|node|bin)$/i.test(p)) continue;
+    try { if (fs.statSync(p).isFile()) return p; } catch (e) { /* 非文件参数忽略 */ }
+  }
+  return "";
+}
+let pendingOpenFile = ""; // bootstrap 完成前收到的打开请求，就绪后补发
+function handleOpenFile(p: string) {
+  if (!win) return;
+  win.show(); win.focus();
+  if (win._booted) {
+    try { win.webContents.send("file:open", { path: p }); } catch (e) { /* 窗口未就绪则稍后由 bootstrap 补发 */ }
+  } else {
+    pendingOpenFile = p;
+  }
+}
 
 // ── 阶段L · 全局/应用内热键（FR-1 声明 → FR-9 管理）────────────────────────
 // 声明源：plugins/<id>/manifest.json 的 hotkeys[]（静态文件，每次实时扫描，无缓存）
@@ -452,6 +618,7 @@ function scanDeclaredHotkeys() {
     for (const hk of mf.hotkeys) {
       if (!hk || !hk.id) continue;
       const rawCombo = hk.combo || "";
+      const hkw = hk.window;
       out.push({
         key: pid + "::" + hk.id, pluginId: pid, pluginName: mf.name || pid, id: hk.id,
         name: hk.name || hk.id, desc: hk.desc || "",
@@ -459,6 +626,12 @@ function scanDeclaredHotkeys() {
         scope: hk.scope === "app" ? "app" : "global",
         method: hk.method || "", action: hk.action || "",
         params: hk.params || {}, timeoutMs: hk.timeoutMs || 0,
+        // 呈现窗声明（通用字段；宿主不识别插件专用逻辑）
+        hwin: hkw && hkw.page ? {
+          page: hkw.page, title: hkw.title || hk.name || hk.id,
+          width: hkw.width || 480, height: hkw.height || 320,
+          frameless: !!hkw.frameless, singleton: hkw.singleton !== false,
+        } : null,
       });
     }
   }
@@ -515,7 +688,11 @@ async function applyHotkeys() {
   return hkReport;
 }
 
-// fireHotkey 触发派发：优先 host 内置动作（action=host.*），否则经内核 plugin.call 调插件方法。
+// hkWindows 热键呈现窗单例表：hotkey key → BrowserWindow（同热键再按只聚焦，不重复开窗）。
+const hkWindows: Map<string, InstanceType<typeof BrowserWindow>> = new Map();
+
+// fireHotkey 触发派发：优先 host 内置动作（action=host.*）；有呈现窗声明时，窗已开则聚焦，
+// 否则触发 method 并按 window 声明通用开窗；无窗声明的仅调 method。
 function fireHotkey(it) {
   try { if (win) win.webContents.send("hotkey:fired", { pluginId: it.pluginId, id: it.id, name: it.name, combo: it.combo }); } catch (e) {}
   const action = (it.action || "").trim();
@@ -523,13 +700,118 @@ function fireHotkey(it) {
     if (win) { win.show(); win.focus(); win.webContents.send("palette:open"); }
     return;
   }
+  // translate::realtime（Alt+C）专用编排：复刻主面板按钮——未运行→框选区域→跳字幕窗；运行中→停止。
+  // 其余热键仍走下面的通用「method + 呈现窗」路径。
+  if (it.pluginId === "translate" && it.id === "realtime") { void fireTranslateRealtime(it); return; }
+  const wd = it.hwin;
+  if (wd) {
+    if (wd.singleton) {
+      const ex = hkWindows.get(it.key);
+      if (ex && !ex.isDestroyed()) { ex.show(); ex.focus(); return; } // 再按 = 唤起已开窗
+    }
+    fireHotkeyMethod(it);   // 开窗同时触发（后端幂等；结果窗轮询 last_result）
+    openHotkeyWindow(it, wd);
+    return;
+  }
   if (!it.method) { console.warn("[hotkey] 无 method/action，忽略", it.key); return; }
+  fireHotkeyMethod(it);
+}
+
+function fireHotkeyMethod(it) {
   rpc("plugin.call", { pluginId: it.pluginId, method: it.method, params: it.params || {}, timeoutMs: it.timeoutMs || 15000 })
     .catch(e => {
       const msg = String((e && e.message) || e);
       console.error("[hotkey] 触发失败", it.key, msg);
       try { if (win) win.webContents.send("hotkey:error", { pluginId: it.pluginId, id: it.id, name: it.name, error: msg }); } catch (_) {}
     });
+}
+
+// openHotkeyWindow 按热键声明通用开窗：页面经内核 HTTP 提供，附 auth/kport 让子页自连 WS。
+function openHotkeyWindow(it, wd) {
+  if (!kernelAuth) return;
+  const url = "http://127.0.0.1:" + kernelAuth.port + "/plugin/" + it.pluginId + "/" + wd.page;
+  const full = url + "?auth=" + encodeURIComponent(kernelAuth.token) + "&kport=" + kernelAuth.port;
+  const sub = spawnPluginWindow(full, { title: wd.title, width: wd.width, height: wd.height, frameless: wd.frameless });
+  if (wd.singleton) {
+    hkWindows.set(it.key, sub);
+    sub.on("closed", () => { if (hkWindows.get(it.key) === sub) hkWindows.delete(it.key); });
+  }
+}
+
+// ── translate::realtime（Alt+C）热键专用编排 ──────────────────────────
+// 完全复刻 translate 插件页 runApp(key=screenSub) 的两阶段：
+//   运行中 → 关字幕窗（sub_win beforeunload 自带 stop）+ 兜底显式 stop + 关常驻金框；
+//   未运行 → pick_reset → 开 translate_overlay（interactive + persistent 金框）
+//            → 等 pickerDone/Abort → 完成则按 hwin 打开 sub_win.html（其 boot 自启 screenSub 循环）。
+const TRANSLATE_OVERLAY_ID = "translate_overlay";
+let realtimeFlowBusy = false; // 防重入：编排进行中再按 Alt+C 直接忽略，避免叠加开窗
+
+async function translateAppStatus() {
+  const r = await rpc("plugin.call", { pluginId: "translate", method: "translate.app.status", params: {} }, 8000);
+  return r && r.result !== undefined ? r.result : r;
+}
+
+// 等待框选结束：复刻 app.js waitPickFinish（300ms 轮询，默认 60s 上限）。
+// 返回 'done' | 'abort' | 'timeout'。
+function waitTranslatePickFinish(timeoutMs = 60000) {
+  return new Promise((res) => {
+    const start = Date.now();
+    const t = setInterval(async () => {
+      let a: any = {};
+      try { a = await translateAppStatus(); } catch (e) { /* 单轮失败继续轮询 */ }
+      if (a.pickerDone || a.pickerAbort || Date.now() - start > timeoutMs) {
+        clearInterval(t);
+        res(a.pickerDone ? "done" : (a.pickerAbort ? "abort" : "timeout"));
+      }
+    }, 300);
+  });
+}
+
+function notifyHotkeyError(it: any, msg: string) {
+  console.error("[hotkey] translate::realtime 编排失败:", msg);
+  try { if (win) win.webContents.send("hotkey:error", { pluginId: it.pluginId, id: it.id, name: it.name, error: msg }); } catch (e) {}
+}
+
+async function fireTranslateRealtime(it: any) {
+  if (realtimeFlowBusy) return;
+  realtimeFlowBusy = true;
+  try {
+    let status: any = {};
+    try { status = await translateAppStatus(); }
+    catch (e: any) { notifyHotkeyError(it, "状态读取失败：" + ((e && e.message) || e)); return; }
+    const existing = hkWindows.get(it.key);
+    const running = !!status.subRunning || (existing && !existing.isDestroyed());
+    if (running) {
+      // 关字幕窗：sub_win beforeunload 自动 translate.app.stop + pick_abort；再兜底显式 stop。
+      if (existing && !existing.isDestroyed()) existing.close();
+      try {
+        await rpc("plugin.call", { pluginId: "translate", method: "translate.app.stop", params: { key: "realtime" } }, 10000);
+      } catch (e) { /* 窗内已 stop，忽略 */ }
+      closeOverlayInternal(TRANSLATE_OVERLAY_ID); // 关常驻金框
+      return;
+    }
+    // 未运行：清上一次 done/abort 残留 → 开持久金框（开窗即 pick 模态，后端此期间跳过采集）。
+    try {
+      await rpc("plugin.call", { pluginId: "translate", method: "translate.app.pick_reset", params: {} }, 8000);
+    } catch (e) { /* 忽略 */ }
+    const opened = await openOverlayInternal(TRANSLATE_OVERLAY_ID, { interactive: true, persistent: true });
+    if (!opened || !opened.ok) { notifyHotkeyError(it, (opened && opened.error) || "打开选区失败"); return; }
+    const pickSt = await waitTranslatePickFinish(60000);
+    if (pickSt !== "done") {
+      // 取消/超时：关金框并清状态（与 app.js runApp 的取消分支一致）。
+      closeOverlayInternal(TRANSLATE_OVERLAY_ID);
+      try {
+        await rpc("plugin.call", { pluginId: "translate", method: "translate.app.pick_reset", params: {} }, 8000);
+      } catch (e) { /* 忽略 */ }
+      return;
+    }
+    // 完成：金框保留、sel.html 已自行切入 live 穿透态；打开字幕窗，其 boot() 幂等启动 screenSub 循环。
+    openHotkeyWindow(it, it.hwin);
+  } catch (e: any) {
+    notifyHotkeyError(it, (e && e.message) || String(e));
+  } finally {
+    realtimeFlowBusy = false;
+  }
 }
 
 ipcMain.handle("hotkeys:list", async () => ({ items: await resolveHotkeys(), report: await applyHotkeys(), store: "内核持有 state/hotkeys.json" }));
@@ -635,7 +917,8 @@ function connect(auth: any): Promise<any> {
           } else if (p.source) {
             console.log("[overlay:miss]", p.source, msg.method, "route=", !!overlayRoute.get(p.source));
           }
-          win.webContents.send("kernel:event", JSON.stringify(msg));
+          // 判活：主窗关闭后内核广播仍可能到达，直接 send 会抛 Object has been destroyed
+          if (win && !win.isDestroyed()) win.webContents.send("kernel:event", JSON.stringify(msg));
         }
       });
     });
@@ -669,11 +952,24 @@ function rpc(method, params, timeoutMs = 15000): Promise<any> {
   });
 }
 
-app.whenReady().then(() => {
-  createWindow();
-  setupTray();
-  registerShortcuts();
-});
+// §27：单实例。Windows「打开方式」以新进程拉起 → 无锁则退出；有锁则转发文件路径。
+const gotSingleLock = app.requestSingleInstanceLock();
+if (!gotSingleLock) {
+  app.quit();
+} else {
+  app.on("second-instance", (_e, argv) => {
+    const f = extractOpenFile(argv.slice(1));
+    if (f) handleOpenFile(f); else showMain();
+  });
+  app.whenReady().then(() => {
+    createWindow();
+    setupTray();
+    registerShortcuts();
+    registerFileAssoc(); // §27：静默注册「打开方式」，失败不阻断启动
+    const f0 = extractOpenFile(process.argv.slice(1));
+    if (f0) handleOpenFile(f0); // 首次启动即带文件（应用未运行时右键打开）
+  });
+}
 
 // 阶段D·全局热键（FR-9）：Ctrl+K / Ctrl+Shift+P 打开命令面板，带冲突检测兜底
 function registerShortcuts() {
@@ -695,6 +991,42 @@ function registerShortcuts() {
   }
 }
 
+let quittingAfterProxyShutdown = false;
+let proxyShutdownStarted = false;
+
+app.on("before-quit", (event) => {
+  if (quittingAfterProxyShutdown) return;
+  event.preventDefault();
+  if (proxyShutdownStarted) return;
+  proxyShutdownStarted = true;
+
+  (async () => {
+    try {
+      if (kernelProc && ws) {
+        const listing = await rpc("plugin.list", {}, 2500);
+        const proxy = (listing && listing.plugins || []).find((item: any) => item.pluginId === "proxy");
+        if (proxy && proxy.state === "RUNNING") {
+          await rpc("plugin.call", {
+            pluginId: "proxy",
+            method: "shutdown",
+            params: {},
+            timeoutMs: 5000,
+          }, 6000);
+        }
+      }
+    } catch (err: any) {
+      console.warn("[host] proxy graceful shutdown failed:", String((err && err.message) || err));
+    } finally {
+      quittingAfterProxyShutdown = true;
+      if (kernelProc) {
+        kernelProc.kill();
+        kernelProc = null;
+      }
+      app.quit();
+    }
+  })();
+});
+
 app.on("will-quit", () => {
   globalShortcut.unregisterAll();
   overlayWindows.forEach((w) => { if (w && !w.isDestroyed()) w.destroy(); });
@@ -703,6 +1035,5 @@ app.on("will-quit", () => {
 });
 
 app.on("window-all-closed", () => {
-  if (kernelProc) kernelProc.kill();
   app.quit();
 });

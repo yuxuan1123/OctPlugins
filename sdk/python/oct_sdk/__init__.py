@@ -16,7 +16,7 @@ import sys
 import threading
 import queue
 
-from .protocol_errors import CODES, DIAG_BY_CODE  # §19 派生，勿硬编码错误码
+from .protocol_errors import CODES, DIAG_BY_CODE, MESSAGES  # §19 派生，勿硬编码错误码
 
 __version__ = "0.1.0"
 
@@ -24,6 +24,21 @@ __version__ = "0.1.0"
 _ERR_INTERNAL = -32603
 
 _PROTOCOL_VERSION = 1
+
+
+class ProtocolError(Exception):
+    """携带 §19 错误码的业务异常：SDK 直接回该错误帧，不降级为 E_INTERNAL。
+
+    插件用 `raise ProtocolError("E_TOOL_UNAVAILABLE", "...")` 表达「外部可执行文件缺失」
+    这类语义化失败，宿主/调用方据此得到准确 code 与 diag。
+    """
+
+    def __init__(self, diag, message=None, data=None):
+        self.diag = diag
+        self.code = CODES.get(diag, _ERR_INTERNAL)
+        self.message = message or MESSAGES.get(diag, diag)
+        self.data = dict(data) if data else {}
+        super().__init__(self.message)
 
 # ── fd1 接管（模块导入即生效，§11.2 首行接管） ────────────────────────
 def _capture_stdout():
@@ -171,7 +186,10 @@ def _handle_request(req):
         _write({"jsonrpc": "2.0", "id": rid, "result": result})
     except Exception as e:  # noqa: BLE001 —— 协议错误必须回错误帧而非崩溃
         # §19 派生：错误码/诊断码取 pkg/protocol，不硬编码。
-        if isinstance(e, KeyError):  # 未知 method
+        if isinstance(e, ProtocolError):
+            _err = {"code": e.code, "message": e.message,
+                    "data": dict({"diag": e.diag}, **e.data)}
+        elif isinstance(e, KeyError):  # 未知 method
             _err = {"code": CODES["E_METHOD_NOT_FOUND"], "message": "unknown method", "data": {"diag": "E_METHOD_NOT_FOUND"}}
         else:  # 业务/IO 等通用内部错误
             _err = {"code": _ERR_INTERNAL, "message": str(e), "data": {"diag": "E_INTERNAL"}}

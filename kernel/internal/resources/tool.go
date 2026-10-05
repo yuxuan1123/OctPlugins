@@ -85,8 +85,51 @@ func Locate(method, id, declaredPath, toolsRoot string) LocateResult {
 		if p, err := exec.LookPath(id); err == nil {
 			return LocateResult{Path: p, Found: true}
 		}
+		// LookPath 失败后的兜底：常见安装路径 + 系统注册表登记（§14.2 env 扩展）。
+		// 覆盖 LibreOffice（soffice 不在 PATH）、便携 ffmpeg 等已安装但未入 PATH 的情况。
+		if p, ok := locateCommon(id); ok {
+			return LocateResult{Path: p, Found: true}
+		}
 		return LocateResult{Err: fmt.Errorf("tool %s not found in PATH (E_TOOL_UNAVAILABLE)", id)}
 	}
+}
+
+// locateCommon 在 LookPath 失败后探测常见安装位置：先按系统注册表登记（仅 Windows），
+// 再按跨平台常见路径逐一 stat。返回第一个存在的可执行文件。
+func locateCommon(id string) (string, bool) {
+	for _, p := range append(registryToolPaths(id), wellKnownPaths(id)...) {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// wellKnownPaths 常见安装路径（跨平台硬编码探测；注册表未覆盖时兜底）。
+func wellKnownPaths(id string) []string {
+	var base []string
+	switch id {
+	case "soffice", "libreoffice", "soffice.bin", "soffice.exe":
+		base = []string{
+			`C:\Program Files\LibreOffice\program\soffice.exe`,
+			`C:\Program Files (x86)\LibreOffice\program\soffice.exe`,
+			`/usr/bin/soffice`, `/usr/local/bin/soffice`, `/opt/libreoffice/program/soffice`,
+		}
+		if ad := os.Getenv("LOCALAPPDATA"); ad != "" {
+			base = append(base, filepath.Join(ad, `Programs\LibreOffice\program\soffice.exe`))
+		}
+	case "ffmpeg":
+		base = []string{
+			`C:\Program Files\ffmpeg\bin\ffmpeg.exe`, `/usr/bin/ffmpeg`, `/usr/local/bin/ffmpeg`,
+		}
+	case "ffprobe":
+		base = []string{
+			`C:\Program Files\ffmpeg\bin\ffprobe.exe`, `/usr/bin/ffprobe`, `/usr/local/bin/ffprobe`,
+		}
+	case "pandoc":
+		base = []string{`C:\Program Files\Pandoc\pandoc.exe`, `/usr/bin/pandoc`, `/usr/local/bin/pandoc`}
+	}
+	return base
 }
 
 // Spawn 派生工具进程（§14.6 start）：env 由调用方组装；失败返回错误。

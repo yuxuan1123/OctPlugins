@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "_comment": [
+    "outtool 描述清单（转化域 §5.2 / §5.3）。",
+    "outtool 是 ffmpeg / pandoc / ollama 这类外部可执行文件：没有 manifest、没有 methods、",
+    "不进 §11.6 函数注册表。但 §5.2 要求它们也能声明自己提供的模型，故用这份独立清单承载。",
+    "内核 boot 时读入并把 providesModels 登记进 registry.json.models（provider = outtool id）。",
+    "文件名固定为 resources/outtools.json；文件缺失表示没有 outtool 侧模型声明（常态）。",
+    "",
+    "定位方式对齐 §14.2 三选一：locate = bundled | explicitPath | env（缺省 env）。",
+    "先到先得：tool manifest 已声明的同名模型不会被此处的声明覆盖。"
+  ],
+  "outtools": {}
+}

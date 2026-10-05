@@ -84,7 +84,59 @@ func Run(root string) error {
 	token := newToken(32)
 	srv := ipcserver.NewServer(token, manager, gate, installer, resourcesDir, pluginsDir)
 	// §9/§17.2：user-settings.json 作为 settingsSchema 驱动设置页的唯一落点（C 层）。
-	srv.SetSettingsStore(config.NewSettings(filepath.Join(root, "config", "user-settings.json")))
+	settingsStore := config.NewSettings(filepath.Join(root, "config", "user-settings.json"))
+	srv.SetSettingsStore(settingsStore)
+	// 转化域 §8.1：能力级 pin 的唯一读取口。lifecycle 不直接依赖 config（config 已依赖
+	// lifecycle，直接引用会形成循环导入），故以 provider 形式注入。
+	manager.SetPinsProvider(func() map[string]string {
+		f, err := settingsStore.Load()
+		if err != nil {
+			log.Printf("[kernel] load pins: %v", err)
+			return map[string]string{}
+		}
+		return f.Pins()
+	})
+	// 转化域 §8.1：pin 的唯一写入方是内核（落 config/user-settings.json）。
+	manager.SetPinWriter(settingsStore.SetPin)
+	// §17.2 A：插件「自己的」设置经装配根接 config.Settings + ResolvePlugin，
+	// 与宿主「设置→插件/tool内部设置」页（plugin.getSettings/setSettings）同一合并语义。
+	manager.SetSettingsResolver(func(pluginID string, mf lifecycle.Manifest) (map[string]any, error) {
+		f, err := settingsStore.Load()
+		if err != nil {
+			return nil, err
+		}
+		user := map[string]any{}
+		if pc, ok := f.Plugins[pluginID]; ok && pc.Settings != nil {
+			user = pc.Settings
+		}
+		ep := config.ResolvePlugin(pluginID, mf, config.PluginCfg{Settings: user, Profile: ""})
+		return ep.Settings, nil
+	})
+	manager.SetSettingsWriter(func(pluginID string, mf lifecycle.Manifest, settings map[string]any) error {
+		// §17.2 A MUST：settingsSchema 未覆盖的字段不得写入（丢弃未知键）。
+		allowed := config.SchemaProps(mf.SettingsSchema)
+		filtered := map[string]any{}
+		for _, k := range allowed {
+			if v, has := settings[k]; has {
+				filtered[k] = v
+			}
+		}
+		f, err := settingsStore.Load()
+		if err != nil {
+			return err
+		}
+		if f.Plugins == nil {
+			f.Plugins = map[string]config.PluginCfg{}
+		}
+		pc := f.Plugins[pluginID]
+		pc.Settings = filtered
+		f.Plugins[pluginID] = pc
+		return settingsStore.Save(f)
+	})
+	// 转化域 §20.5：模型存储根由用户决定（user-settings.json 的 models.root），空则用内置默认。
+	if f, err := settingsStore.Load(); err == nil {
+		manager.SetModelsRoot(f.ModelsRoot())
+	}
 	// §17.3：内核独占写 state/。宿主一律经 RPC（plugin.resources/hotkeys.*）读写，不得直连文件。
 	srv.SetStateDir(storeDir)
 
@@ -96,12 +148,16 @@ func Run(root string) error {
 	// 事件广播/状态回调先装配好，供随后异步启动的插件实例使用。
 	manager.SetOnState(func(id, state string) { srv.NotifyState(id, state) })
 	manager.SetOnDepsProgress(func(id, phase string) { srv.NotifyDepsProgress(id, phase) })
+	manager.SetOnModelEvent(func(typ string, data any) { srv.NotifyModelEvent(typ, data) })
 	manager.SetOnSpawn(func(p *lifecycle.Plugin) { p.Event = srv.EventSink() })
 	srv.WireEvents()
 	defer manager.StopAll()
 
 	// 同步快速登记全部插件：plugin.list / 侧栏「注册表预显示」在 auth 前即完整。
 	manager.RegisterAll()
+	// 转化域 §5.2/§5.3：outtool 描述清单里的模型声明同样登记进 registry.json.models
+	// （outtool 无 manifest，故需独立清单承载；provider 记为 outtool id）。
+	manager.RegisterOuttoolsFrom(resourcesDir)
 	manager.SyncResourceRegistry() // §8：登记后把 externalDependencies 资源节落盘 registry.json
 
 	go srv.Serve(ln)

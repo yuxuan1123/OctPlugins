@@ -404,9 +404,9 @@ func (p *Plugin) dispatchGate(id int64, method string, params []byte) {
 		ok, result = true, map[string]any{"path": pw.Path, "bytes": len(pw.Data)}
 	case "gate.execute_command":
 		var pc struct {
-			Command string   `json:"command"`     // 可执行文件路径（不经过 shell，防注入）
-			Args    []string `json:"args"`
-			TimeoutMs int64  `json:"timeoutMs"`
+			Command   string   `json:"command"` // 可执行文件路径（不经过 shell，防注入）
+			Args      []string `json:"args"`
+			TimeoutMs int64    `json:"timeoutMs"`
 		}
 		_ = json.Unmarshal(params, &pc)
 		if p.Gate != nil && p.Gate.Check(p.ID, perms.ExecuteCommand) != nil {
@@ -442,8 +442,9 @@ func (p *Plugin) dispatchGate(id int64, method string, params []byte) {
 		ok, result = true, map[string]any{"exists": err == nil}
 	case "registry.call":
 		var pr struct {
-			Name   string          `json:"name"`
-			Params json.RawMessage `json:"params"`
+			Name      string          `json:"name"`
+			Params    json.RawMessage `json:"params"`
+			TimeoutMs *int            `json:"timeoutMs"`
 		}
 		_ = json.Unmarshal(params, &pr)
 		if p.mgr == nil {
@@ -454,7 +455,13 @@ func (p *Plugin) dispatchGate(id int64, method string, params []byte) {
 		if len(pr.Params) > 0 {
 			_ = json.Unmarshal(pr.Params, &in)
 		}
-		resp, err := p.mgr.CallFunc(pr.Name, in, 15*time.Second)
+		// 默认 15s；调用方（如 conversion 编排）可经 timeoutMs 放宽，
+		// 与宿主侧 ws.go handleRegistryCall 的语义一致（§11.6）。
+		timeout := 15 * time.Second
+		if pr.TimeoutMs != nil && *pr.TimeoutMs > 0 {
+			timeout = time.Duration(*pr.TimeoutMs) * time.Millisecond
+		}
+		resp, err := p.mgr.CallFunc(pr.Name, in, timeout)
 		if err != nil {
 			code, ok, data = protocol.ErrPluginMissing, false, map[string]any{"error": err.Error()}
 			break
@@ -464,6 +471,105 @@ func (p *Plugin) dispatchGate(id int64, method string, params []byte) {
 			break
 		}
 		ok, result = true, map[string]any{"ok": true, "result": resp.Result}
+	// gate.model_ensure 转化域 §22.3 / §四：插件只能「请求宿主确保模型就绪」，
+	// 由宿主按 §15.4 解析并（必要时）按 §12 走 handover。需 local_model 权限位。
+	case "gate.model_ensure":
+		var pm struct {
+			Capability string `json:"capability"`
+			ModelID    string `json:"modelId"`
+			ID         string `json:"id"`
+			TimeoutMs  int    `json:"timeoutMs"`
+		}
+		_ = json.Unmarshal(params, &pm)
+		if pm.ModelID == "" {
+			pm.ModelID = pm.ID
+		}
+		if p.Gate != nil && p.Gate.Check(p.ID, perms.LocalModel) != nil {
+			code, ok, data = protocol.ErrPermDenied, false, map[string]any{"pluginId": p.ID, "perm": perms.LocalModel}
+			break
+		}
+		if p.mgr == nil {
+			code, ok = protocol.ErrMethodNotFound, false
+			break
+		}
+		// §23.1：插件只能请求自己在 requiresCapabilities 里声明过的能力。
+		// （manifest 未声明该字段时不做约束，保持向后兼容。）
+		if pm.Capability != "" {
+			if _, allowed := requiresCapability(p.Manifest, pm.Capability); !allowed {
+				code = protocol.ErrPermDenied
+				ok = false
+				data = map[string]any{
+					"diag":       protocol.DiagPermissionDenied,
+					"pluginId":   p.ID,
+					"capability": pm.Capability,
+					"declared":   p.Manifest.RequiresCapabilities,
+					"error": fmt.Sprintf("插件 %s 未在 requiresCapabilities 中声明能力 %q（§23.1）",
+						p.ID, pm.Capability),
+				}
+				break
+			}
+		}
+		to := ensureTimeout
+		if pm.TimeoutMs > 0 {
+			to = time.Duration(pm.TimeoutMs) * time.Millisecond
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), to)
+		defer cancel()
+		er, err := p.mgr.EnsureModel(ctx, pm.Capability, pm.ModelID)
+		if err != nil {
+			code, ok, data = protocol.ErrPluginMissing, false, map[string]any{"error": err.Error()}
+			break
+		}
+		ok, result = true, map[string]any{"ok": true, "model": er}
+	// gate.models_list 转化域 §22.4/§25：conversion 代理渲染模型选择器所需的
+	// registry.json.models 视图（含 pinned/effective/unavailable）。需 local_model 权限位。
+	case "gate.models_list":
+		if p.Gate != nil && p.Gate.Check(p.ID, perms.LocalModel) != nil {
+			code, ok, data = protocol.ErrPermDenied, false, map[string]any{"pluginId": p.ID, "perm": perms.LocalModel}
+			break
+		}
+		if p.mgr == nil {
+			code, ok = protocol.ErrMethodNotFound, false
+			break
+		}
+		pins := p.mgr.pins()
+		ok, result = true, map[string]any{
+			"ok":           true,
+			"models":       p.mgr.ModelsSnapshot(pins),
+			"capabilities": p.mgr.CapabilitiesSnapshot(pins),
+			"pins":         pins,
+			"contracts":    p.mgr.Contracts(),
+		}
+	// gate.models_pin 转化域 §8.1：写入/清除能力级 pin（设置级持久默认）。需 local_model 权限位。
+	case "gate.models_pin":
+		var pp struct {
+			Capability string `json:"capability"`
+			ModelID    string `json:"modelId"`
+		}
+		_ = json.Unmarshal(params, &pp)
+		if p.Gate != nil && p.Gate.Check(p.ID, perms.LocalModel) != nil {
+			code, ok, data = protocol.ErrPermDenied, false, map[string]any{"pluginId": p.ID, "perm": perms.LocalModel}
+			break
+		}
+		if p.mgr == nil {
+			code, ok = protocol.ErrMethodNotFound, false
+			break
+		}
+		if pp.Capability == "" && pp.ModelID != "" {
+			pp.Capability = p.mgr.CapabilityOf(pp.ModelID)
+		}
+		if pp.Capability == "" {
+			code, ok, data = protocol.ErrParse, false, map[string]any{"error": "capability required"}
+			break
+		}
+		if err := p.mgr.SetPin(pp.Capability, pp.ModelID); err != nil {
+			code, ok, data = protocol.ErrIO, false, map[string]any{"error": err.Error()}
+			break
+		}
+		ok, result = true, map[string]any{
+			"ok": true, "capability": pp.Capability, "pinned": pp.ModelID,
+			"resolution": p.mgr.ResolveCapability(pp.Capability, p.mgr.pins()),
+		}
 	case "event.emit":
 		var pr struct {
 			Type string `json:"type"`
@@ -474,6 +580,68 @@ func (p *Plugin) dispatchGate(id int64, method string, params []byte) {
 			p.Event(p.ID, pr.Type, pr.Data)
 		}
 		ok, result = true, map[string]any{"ok": true}
+	// §17.2 A：插件读取「自己的」生效设置（user-settings plugins[id].settings 经 manifest 默认值
+	// 合并）。设置由宿主「设置→插件/tool内部设置」页按 settingsSchema 渲染编辑；插件不直读
+	// config/user-settings.json（内核独占写，§17.3）。需 local_model 权限位。
+	case "gate.settings_get":
+		if p.Gate != nil && p.Gate.Check(p.ID, perms.LocalModel) != nil {
+			code, ok, data = protocol.ErrPermDenied, false, map[string]any{"pluginId": p.ID, "perm": perms.LocalModel}
+			break
+		}
+		if p.mgr == nil {
+			code, ok = protocol.ErrMethodNotFound, false
+			break
+		}
+		eff, err := p.mgr.SettingsEffective(p.ID, p.Manifest)
+		if err != nil {
+			code, ok, data = protocol.ErrIO, false, map[string]any{"error": err.Error()}
+			break
+		}
+		if eff == nil {
+			eff = map[string]any{}
+		}
+		ok, result = true, map[string]any{"ok": true, "settings": eff}
+	// §17.2 A：插件写「自己的」设置（仅写 settingsSchema 声明字段）。
+	// capability-gateway.setPreference 的落盘入口。
+	case "gate.settings_set":
+		if p.Gate != nil && p.Gate.Check(p.ID, perms.LocalModel) != nil {
+			code, ok, data = protocol.ErrPermDenied, false, map[string]any{"pluginId": p.ID, "perm": perms.LocalModel}
+			break
+		}
+		if p.mgr == nil {
+			code, ok = protocol.ErrMethodNotFound, false
+			break
+		}
+		var ps struct {
+			Settings map[string]any `json:"settings"`
+		}
+		_ = json.Unmarshal(params, &ps)
+		if err := p.mgr.SetSettings(p.ID, p.Manifest, ps.Settings); err != nil {
+			code, ok, data = protocol.ErrIO, false, map[string]any{"error": err.Error()}
+			break
+		}
+		ok, result = true, map[string]any{"ok": true}
+	// §5.5 隐私权限断言：插件在执行敏感动作（屏幕采集/麦克风录音）前主动断言权限位。
+	// 未授权返回 E_PERM_DENIED，由插件转为对用户的明确报错（不打哑炮）。
+	case "gate.perm_assert":
+		var pa struct {
+			Perm string `json:"perm"`
+		}
+		_ = json.Unmarshal(params, &pa)
+		if p.Gate == nil {
+			code, ok = protocol.ErrPluginState, false
+			break
+		}
+		// 只允许断言已声明（manifest permissions）的权限位，防止试探未声明的高敏权限。
+		if err := p.Gate.CheckDeclared(p.ID, pa.Perm); err != nil {
+			code, ok, data = protocol.ErrParse, false, map[string]any{"pluginId": p.ID, "perm": pa.Perm, "error": err.Error()}
+			break
+		}
+		if err := p.Gate.Check(p.ID, pa.Perm); err != nil {
+			code, ok, data = protocol.ErrPermDenied, false, map[string]any{"pluginId": p.ID, "perm": pa.Perm}
+			break
+		}
+		ok, result = true, map[string]any{"ok": true, "perm": pa.Perm}
 	case "sdk.busy": // §10.5：申请/释放 busy（maxBusyMs>0 申请，0 释放）
 		var pr struct {
 			MaxBusyMs int64 `json:"maxBusyMs"`

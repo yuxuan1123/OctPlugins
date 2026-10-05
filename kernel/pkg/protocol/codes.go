@@ -26,6 +26,8 @@ const (
 	DiagToolUnavailable  = "E_TOOL_UNAVAILABLE"
 	DiagModelLoadTimeout = "E_MODEL_LOAD_TIMEOUT"
 	DiagVRAMInsufficient = "E_VRAM_INSUFFICIENT"
+	// DiagModelNotReady：模型尚未由宿主加载（转化域 §19.6）。
+	DiagModelNotReady = "E_MODEL_NOT_READY"
 )
 
 // 方法名常量：宿主/插件/内核共同引用的 JSON-RPC method。
@@ -65,6 +67,9 @@ const (
 
 	MethodGateFileRead   = "gate.file_read"
 	MethodGateFileExit   = "gate.file_exists"
+	MethodGateModelReady = "gate.model_ensure"
+	MethodGateSettingsGet = "gate.settings_get" // §17.2 A：插件读「自己的」生效设置（plugins[id].settings）
+	MethodGateSettingsSet = "gate.settings_set" // §17.2 A：插件写「自己的」设置（仅 schema 声明字段）
 	MethodUISettingsGet  = "ui.getSettings"
 	MethodUISettingsSet  = "ui.setSettings"
 	MethodEventEmit      = "event.emit"

@@ -41,11 +41,35 @@ type ResourceEntry struct {
 	Verified     bool   `json:"verified,omitempty"`
 }
 
+// ModelEntry 一个模型条目（转化域 §三 registry.json models 节）。
+// 唯一写入方仍是内核 registry 包；来源是 tool / outtool 的声明（providesModels），非目录扫描。
+type ModelEntry struct {
+	Provider    string   `json:"provider,omitempty"`   // 提供它的 tool / outtool id
+	Capability  string   `json:"capability,omitempty"` // ocr/tts/stt/translate；可选项
+	Backend     string   `json:"backend,omitempty"`
+	Path        string   `json:"path,omitempty"`
+	Quant       string   `json:"quant,omitempty"`
+	Languages   []string `json:"languages,omitempty"`
+	SizeBytes   int64    `json:"sizeBytes,omitempty"`
+	MinVramGB   float64  `json:"minVramGB,omitempty"`
+	License     string   `json:"license,omitempty"`
+	QualityTier string   `json:"qualityTier,omitempty"`
+	ColdStartMs int      `json:"coldStartMs,omitempty"`
+	Default     bool     `json:"default,omitempty"`   // 作者声明的该能力默认模型（《理想架构.md》§15.4）
+	Fallbacks   []string `json:"fallbacks,omitempty"` // 作者声明的降级序列（§15.4 / §12.4）
+	Companion   bool     `json:"companion,omitempty"` // 伴随模型：不参与默认选择，不计入能力维度上限
+	// DownloadURL / DownloadSHA256 转化域 §26：首次下载源与校验值（下载由宿主执行）。
+	DownloadURL    string `json:"downloadUrl,omitempty"`
+	DownloadSHA256 string `json:"downloadSha256,omitempty"`
+	State          string `json:"state,omitempty"` // registered / loading / ready / failed
+}
+
 // File registry.json 顶层结构。
 type File struct {
 	SchemaVersion int                      `json:"schemaVersion"`
 	Plugins       map[string]Entry         `json:"plugins,omitempty"`
 	Resources     map[string]ResourceEntry `json:"resources,omitempty"`
+	Models        map[string]ModelEntry    `json:"models,omitempty"`
 }
 
 // Store registry.json 的读写句柄（单实例；写操作原子化并串行化）。
@@ -186,6 +210,41 @@ func (s *Store) SetResource(id string, re ResourceEntry) error {
 		}
 		f.Resources[id] = re
 		return true
+	})
+}
+
+// Model 返回某模型条目；不存在返回 (zero, false)。
+func (s *Store) Model(id string) (ModelEntry, bool) {
+	f, err := s.Load()
+	if err != nil {
+		return ModelEntry{}, false
+	}
+	e, ok := f.Models[id]
+	return e, ok
+}
+
+// SetModel 更新/新增某模型条目并落盘（转化域 §三：来源为 tool / outtool 声明）。
+func (s *Store) SetModel(id string, me ModelEntry) error {
+	return s.Mutate(func(f *File) bool {
+		if f.Models == nil {
+			f.Models = map[string]ModelEntry{}
+		}
+		f.Models[id] = me
+		return true
+	})
+}
+
+// RemoveModelsByProvider 删除某 tool / outtool 声明的全部模型条目（卸载时收回声明）。
+func (s *Store) RemoveModelsByProvider(provider string) error {
+	return s.Mutate(func(f *File) bool {
+		changed := false
+		for id, me := range f.Models {
+			if me.Provider == provider {
+				delete(f.Models, id)
+				changed = true
+			}
+		}
+		return changed
 	})
 }
 

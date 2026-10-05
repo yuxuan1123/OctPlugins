@@ -61,6 +61,8 @@ const (
 	ErrToolUnavailable   = -32016
 	ErrModelLoadTimeout  = -32017
 	ErrVRAMInsufficient  = -32018
+	// ErrModelNotReady 模型尚未由宿主加载（转化域 §19.6：tool / 插件不得自行加载模型）。
+	ErrModelNotReady = -32019
 )
 
 var ErrText = map[int]string{
@@ -86,6 +88,7 @@ var ErrText = map[int]string{
 	ErrToolUnavailable:   "tool unavailable (locate failed)",
 	ErrModelLoadTimeout:  "model load exceeded timeout",
 	ErrVRAMInsufficient:  "insufficient VRAM with no usable fallback",
+	ErrModelNotReady:     "model not loaded by host (§19.6)",
 }
 
 func NewResult(id int64, res any) Response {

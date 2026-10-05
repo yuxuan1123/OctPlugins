@@ -1,6 +1,7 @@
 package ipcserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -85,6 +86,11 @@ func (s *Server) NotifyState(id, state string) {
 // NotifyDepsProgress 由内核 Manager 的安装进度回调注入，把依赖安装阶段推给宿主（§6.4 MUST）。
 func (s *Server) NotifyDepsProgress(id, phase string) {
 	s.broadcast("kernel", "plugin.deps.progress", map[string]any{"id": id, "phase": phase})
+}
+
+// NotifyModelEvent 由内核 Manager 的模型事件回调注入，把 handover 进展推给宿主（转化域 §12.5）。
+func (s *Server) NotifyModelEvent(typ string, data any) {
+	s.broadcast("kernel", typ, data)
 }
 
 // broadcast 把插件事件以 ws 通知（无 id）推给宿主（FR-8 事件通道）。
@@ -237,10 +243,34 @@ func (s *Server) dispatch(conn *websocket.Conn, req protocol.Request) {
 		s.handleRegistryList(conn, req)
 	case "registry.call":
 		s.handleRegistryCall(conn, req)
+	case "registry.models.list":
+		s.handleRegistryModelsList(conn, req)
+	case "registry.models.acquire":
+		s.handleRegistryModelsAcquire(conn, req)
+	case "registry.models.release":
+		s.handleRegistryModelsRelease(conn, req)
+	case "registry.models.switch":
+		s.handleRegistryModelsSwitch(conn, req) // 转化域 §12：handover 接班
+	case "registry.models.pull":
+		s.handleRegistryModelsPull(conn, req) // 转化域 §26：首次下载（宿主执行）
+	case "registry.models.layout":
+		s.handleRegistryModelsLayout(conn, req) // 转化域 §20.5：布局审计（只读）
+	case "registry.models.relocate":
+		s.handleRegistryModelsRelocate(conn, req) // 转化域 §20.5：搬迁到规范布局（用户显式发起）
+	case "registry.models.pin":
+		s.handleRegistryModelsPin(conn, req) // 转化域 §8.1：设置级 pin
+	case "registry.capabilities.list":
+		s.handleRegistryCapabilitiesList(conn, req) // 转化域 §7.4/§25：能力→生效模型
+	case "config.modelsRoot.get":
+		s.handleModelsRootGet(conn, req) // 转化域 §20.5：模型存储根
+	case "config.modelsRoot.set":
+		s.handleModelsRootSet(conn, req)
 	case "command.list":
 		s.handleCommandList(conn, req)
 	case "plugin.getLifecycle":
 		s.handlePluginGetLifecycle(conn, req)
+	case "plugin.contracts":
+		s.handlePluginContracts(conn, req) // 转化域 §23：各插件的能力/outtool/联网契约
 	case "plugin.getSettings":
 		s.handlePluginGetSettings(conn, req)
 	case "plugin.setSettings":
@@ -390,23 +420,9 @@ func (s *Server) handlePluginSetSettings(conn *websocket.Conn, req protocol.Requ
 	s.reply(conn, protocol.NewResult(req.ID, map[string]any{"ok": true}))
 }
 
-// settingsSchemaProps 提取 settingsSchema.properties 声明的字段名。
-// 未声明 schema（nil/非对象/无 properties）时返回空集，调用方据此跳过过滤（保持向后兼容）。
+// settingsSchemaProps 提取 settingsSchema.properties 声明的字段名（实现收敛到 config.SchemaProps）。
 func settingsSchemaProps(raw json.RawMessage) []string {
-	if len(raw) == 0 {
-		return nil
-	}
-	var schema struct {
-		Properties map[string]json.RawMessage `json:"properties"`
-	}
-	if err := json.Unmarshal(raw, &schema); err != nil || len(schema.Properties) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(schema.Properties))
-	for k := range schema.Properties {
-		keys = append(keys, k)
-	}
-	return keys
+	return config.SchemaProps(raw)
 }
 
 // ui.getSettings 读宿主级 UI 设置（user-settings.json -> ui 节，如 sidebarOrder）。§17.2 B。
@@ -1049,6 +1065,277 @@ func (s *Server) serveFavicon(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	w.Header().Set("Content-Type", "image/png")
 	http.ServeContent(w, r, "logo128.png", time.Time{}, f)
+}
+
+// handlePluginContracts 返回各插件的 §23 契约（能力需求 / outtool 白名单 / 联网与可选 profile）。
+func (s *Server) handlePluginContracts(conn *websocket.Conn, req protocol.Request) {
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"contracts": s.smanager.Contracts(),
+	}))
+}
+
+// registry.models.list 返回 registry.json.models 全量（合并 ResourceMap 运行时状态，
+// 并按转化域 §15.4 标注 pinned / effective / unavailable）。
+func (s *Server) handleRegistryModelsList(conn *websocket.Conn, req protocol.Request) {
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"models": s.smanager.ModelsSnapshot(s.pins()), "pins": s.pins(),
+	}))
+}
+
+// pins 读取用户能力级 pin（user-settings.json 的 capabilities.<name>.pin）。
+func (s *Server) pins() map[string]string {
+	if s.settings == nil {
+		return map[string]string{}
+	}
+	f, err := s.settings.Load()
+	if err != nil {
+		return map[string]string{}
+	}
+	return f.Pins()
+}
+
+// registry.capabilities.list 返回各能力维度的生效模型与来源（转化域 §7.4 预加载 / §25 选择器）。
+func (s *Server) handleRegistryCapabilitiesList(conn *websocket.Conn, req protocol.Request) {
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"capabilities": s.smanager.CapabilitiesSnapshot(s.pins()),
+	}))
+}
+
+// registry.models.layout 审计各模型的存储布局是否符合 §20.5 的 <modelId>/<quant>/（只读）。
+func (s *Server) handleRegistryModelsLayout(conn *websocket.Conn, req protocol.Request) {
+	report := s.smanager.ModelLayoutReport()
+	nonConforming := 0
+	for _, l := range report {
+		if !l.Conforming {
+			nonConforming++
+		}
+	}
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"layout": report, "root": s.smanager.ModelsRootDir(),
+		"total": len(report), "nonConforming": nonConforming,
+	}))
+}
+
+// registry.models.relocate 把某模型搬迁到规范布局（§20.5）。
+//
+// params {id, dryRun, confirm}。破坏性操作，故要求 confirm=true 才真正搬；
+// 只给 dryRun 时返回计划（前端应先展示计划再让用户确认）。
+// 搬迁在后台执行，结果经 models.relocate.done / models.relocate.failed 事件回报。
+func (s *Server) handleRegistryModelsRelocate(conn *websocket.Conn, req protocol.Request) {
+	var p struct {
+		ID      string `json:"id"`
+		DryRun  bool   `json:"dryRun"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || p.ID == "" {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, nil))
+		return
+	}
+	if p.DryRun {
+		plan, err := s.smanager.RelocateModel(context.Background(), p.ID, true, nil)
+		if err != nil {
+			s.reply(conn, protocol.NewError(req.ID, protocol.ErrIO, map[string]any{"error": err.Error()}))
+			return
+		}
+		s.reply(conn, protocol.NewResult(req.ID, map[string]any{"ok": true, "plan": plan}))
+		return
+	}
+	if !p.Confirm {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, map[string]any{
+			"error": "拒绝搬迁：需要 confirm=true（§20.5 搬迁是破坏性操作，须用户显式确认）",
+		}))
+		return
+	}
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"ok": true, "id": p.ID, "state": "accepted",
+		"note": "搬迁在后台执行；结果见 models.relocate.done / models.relocate.failed 事件",
+	}))
+	go func() {
+		res, err := s.smanager.RelocateModel(context.Background(), p.ID, false,
+			func(r lifecycle.RelocateResult) { s.broadcast("kernel", "models.relocate.progress", r) })
+		if err != nil {
+			log.Printf("[models] relocate %s failed: %v", p.ID, err)
+			s.broadcast("kernel", "models.relocate.failed", map[string]any{
+				"modelId": p.ID, "error": err.Error(),
+			})
+			return
+		}
+		s.broadcast("kernel", "models.relocate.done", res)
+	}()
+}
+
+// registry.models.pull 首次下载模型权重（转化域 §26：下载由宿主执行 + 进度事件）。
+//
+// 前置：调用方（宿主 UI）MUST 已取得用户明确同意；本 RPC 只执行下载。
+// 进度经 models.download.progress 事件广播（节流 200ms），完成/失败各一条终态事件。
+// params {id}。
+func (s *Server) handleRegistryModelsPull(conn *websocket.Conn, req protocol.Request) {
+	var p struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || p.ID == "" {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, nil))
+		return
+	}
+	// 后台执行：下载可能持续数十分钟，不能占住本连接的请求-响应。
+	// 立即回执 accepted，进度与结果全部经事件推送。
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"ok": true, "id": p.ID, "state": "accepted",
+		"note": "下载在后台执行；进度见 models.download.progress 事件",
+	}))
+	go func() {
+		dest, err := s.smanager.PullModel(context.Background(), p.ID, func(dp lifecycle.DownloadProgress) {
+			s.broadcast("kernel", "models.download.progress", dp)
+		})
+		if err != nil {
+			log.Printf("[models] pull %s failed: %v", p.ID, err)
+			s.broadcast("kernel", "models.download.failed", map[string]any{
+				"modelId": p.ID, "error": err.Error(),
+			})
+			return
+		}
+		s.broadcast("kernel", "models.download.done", map[string]any{
+			"modelId": p.ID, "path": dest,
+		})
+	}()
+}
+
+// registry.models.pin 设置/清除某能力的能力级 pin（转化域 §8.1：持久默认，影响下次启动预加载）。
+// params {capability, modelId}；modelId 为空表示清除 pin（回落作者声明）。
+func (s *Server) handleRegistryModelsPin(conn *websocket.Conn, req protocol.Request) {
+	var p struct {
+		Capability string `json:"capability"`
+		ModelID    string `json:"modelId"`
+		ID         string `json:"id"` // 兼容写法：只给 id 时按该模型声明的能力反查
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, nil))
+		return
+	}
+	if p.Capability == "" && p.ModelID == "" && p.ID != "" {
+		p.ModelID = p.ID
+	}
+	if p.Capability == "" && p.ModelID != "" {
+		p.Capability = s.smanager.CapabilityOf(p.ModelID)
+	}
+	if p.Capability == "" {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, map[string]any{
+			"error": "capability required (or pass a modelId whose capability is known)",
+		}))
+		return
+	}
+	if s.settings == nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrIO, map[string]any{"error": "settings store unavailable"}))
+		return
+	}
+	if err := s.settings.SetPin(p.Capability, p.ModelID); err != nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrIO, map[string]any{"error": err.Error()}))
+		return
+	}
+	res := s.smanager.ResolveCapability(p.Capability, s.pins())
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"ok": true, "capability": p.Capability, "pinned": p.ModelID, "resolution": res,
+	}))
+}
+
+// registry.models.switch 触发一次模型接班（转化域 §12 handover / §13 资源账）。
+// params {capability, id, wait}；wait=true 时等待窗口结束（默认返回 loading，结果走事件）。
+func (s *Server) handleRegistryModelsSwitch(conn *websocket.Conn, req protocol.Request) {
+	var p struct {
+		Capability string `json:"capability"`
+		ID         string `json:"id"`
+		Wait       bool   `json:"wait"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || p.ID == "" {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, nil))
+		return
+	}
+	if p.Capability == "" {
+		p.Capability = s.smanager.CapabilityOf(p.ID)
+	}
+	var (
+		st  lifecycle.HandoverState
+		err error
+	)
+	if p.Wait {
+		st, err = s.smanager.SwitchModelSync(context.Background(), p.Capability, p.ID)
+	} else {
+		st, err = s.smanager.SwitchModel(context.Background(), p.Capability, p.ID)
+	}
+	if err != nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrPluginMissing, map[string]any{"error": err.Error()}))
+		return
+	}
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"ok": st.Phase != "failed", "handover": st,
+	}))
+}
+
+// config.modelsRoot.get 返回模型存储根（转化域 §20.5：模型放哪由用户决定）。
+func (s *Server) handleModelsRootGet(conn *websocket.Conn, req protocol.Request) {
+	configured := ""
+	if s.settings != nil {
+		if f, err := s.settings.Load(); err == nil {
+			configured = f.ModelsRoot()
+		}
+	}
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"root":       s.smanager.ModelsRootDir(),
+		"configured": configured,
+		"default":    lifecycle.DefaultModelsRoot,
+	}))
+}
+
+// config.modelsRoot.set 设置模型存储根；空值清除，回落宿主默认。
+func (s *Server) handleModelsRootSet(conn *websocket.Conn, req protocol.Request) {
+	var p struct {
+		Root string `json:"root"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, nil))
+		return
+	}
+	if s.settings == nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrIO, map[string]any{"error": "settings store unavailable"}))
+		return
+	}
+	if err := s.settings.SetModelsRoot(p.Root); err != nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrIO, map[string]any{"error": err.Error()}))
+		return
+	}
+	s.smanager.SetModelsRoot(p.Root)
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
+		"ok": true, "root": s.smanager.ModelsRootDir(),
+	}))
+}
+
+// registry.models.acquire 由宿主触发模型加载（转化域 §四：加载权在宿主）。params {id}.
+func (s *Server) handleRegistryModelsAcquire(conn *websocket.Conn, req protocol.Request) {
+	var p struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || p.ID == "" {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, nil))
+		return
+	}
+	if err := s.smanager.AcquireModel(p.ID); err != nil {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrPluginMissing, map[string]any{"error": err.Error()}))
+		return
+	}
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{"ok": true, "id": p.ID, "state": "ready"}))
+}
+
+// registry.models.release 宿主释放模型引用。params {id}.
+func (s *Server) handleRegistryModelsRelease(conn *websocket.Conn, req protocol.Request) {
+	var p struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || p.ID == "" {
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrParse, nil))
+		return
+	}
+	s.smanager.ReleaseModel(p.ID)
+	s.reply(conn, protocol.NewResult(req.ID, map[string]any{"ok": true, "id": p.ID}))
 }
 
 // command.list 返回全部可执行命令（FR-9 命令面板），宿主据此补全。
