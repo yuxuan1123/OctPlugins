@@ -183,21 +183,9 @@
       padding-bottom:4px; border-bottom:1px dashed var(--card-line); }
     .lc-bo { justify-content:center; }
     .lc-bo label { display:flex; align-items:center; gap:8px; color:var(--ink); font-size:12px; cursor:pointer; }
-    /* 单插件选择：搜索下拉组合框 */
+    /* 「搜索+选择」组合框：容器只负责纵向排布；输入框/下拉/清空 ✕ 的样式与交互由共享组件
+       /res/theme/octsel.js（构建时拷入 build/octsel.js）统一注入，宿主与插件保持同一套观感 */
     .lc-pick { display:flex; flex-direction:column; gap:8px; margin:12px 0 2px; position:relative; }
-    .lc-pick input { width:100%; background:rgba(255,252,245,.5); border:1px solid var(--line);
-      border-radius:10px; padding:9px 12px; color:var(--ink); font-size:13px; font-family:inherit; }
-    .lc-pick input:focus { outline:none; border-color:var(--ink-soft); }
-    /* 自绘下拉：命中项排前加粗，未命中项仍全部展示（置灰） */
-    .lc-drop { position:absolute; top:calc(100% + 4px); left:0; right:0; z-index:20;
-      max-height:260px; overflow-y:auto; background:var(--paper-2);
-      border:1px solid var(--card-line); border-radius:10px; box-shadow:var(--shadow); }
-    .lc-dd-item { padding:8px 12px; font-size:13px; color:var(--ink); cursor:pointer;
-      border-bottom:1px solid var(--card-line); }
-    .lc-dd-item:last-child { border-bottom:none; }
-    .lc-dd-item:hover, .lc-dd-item.cur { background:rgba(178,58,48,.10); color:var(--cinnabar); }
-    .lc-dd-item.hit { font-weight:700; color:var(--ink); }
-    .lc-dd-item:not(.hit) { color:var(--ink-faint); }
 
     /* ── 命令面板（阶段D，FR-9） ── */
     #palette { position:fixed; inset:0; z-index:100; display:none;
@@ -362,7 +350,7 @@
             <h2>启动与资源 · 单插件策略</h2>
             <div class="lc-pick">
               <input id="lcPick" type="text" placeholder="搜索并选择插件名称或 ID…" autocomplete="off" spellcheck="false">
-              <div id="lcDrop" class="lc-drop" hidden></div>
+              <div id="lcDrop" class="oct-sel-drop" hidden></div>
             </div>
             <button class="mini" id="btnLcRefresh" style="margin-top:8px">刷新</button>
             <div id="lcPerPluginBox"></div>
@@ -376,16 +364,16 @@
             <h2>插件/tool内部设置</h2>
             <p style="font-size:12px;color:var(--ink-soft)">由插件/tool <b>manifest.json</b> 的 <code>settingsSchema</code>（JSON Schema）驱动。仅保存 schema 覆盖的字段（§17.2 A），非 schema 字段不会被写入，新增字段无需改宿主代码。选择插件/tool 后在此编辑其内部设置。</p>
             <div class="lc-pick">
-              <input id="psPick" type="text" list="psPlugins" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
-              <datalist id="psPlugins"></datalist>
+              <input id="psPick" type="text" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
+              <div id="psDrop" class="oct-sel-drop" hidden></div>
             </div>
             <div id="psArea"><span class="risk">请在上方选择插件。</span></div>
           </div>
           <div class="card" data-sec="G">
             <h2>插件依赖（隔离环境）</h2>
             <div class="lc-pick">
-              <input id="depPick" type="text" list="depPlugins" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
-              <datalist id="depPlugins"></datalist>
+              <input id="depPick" type="text" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
+              <div id="depDrop" class="oct-sel-drop" hidden></div>
               <button class="mini" id="btnDepRefresh">刷新</button>
             </div>
             <div class="box" id="depArea">连接后加载…</div>
@@ -416,8 +404,8 @@
             <p style="font-size:12px;color:var(--ink-soft)">统一管理各插件的本地 AI 模型与外部二进制：先选择资源，再配置其安装地址、内存「加载时机」与「结束时机」。默认懒加载（用到才加载），闲置释放时长可自定义（默认 10 分钟）。</p>
 
             <div class="lc-pick">
-              <input id="resPick" type="text" list="resOpts" placeholder="搜索并选择 AI 模型 或 外部二进制…" autocomplete="off">
-              <datalist id="resOpts"></datalist>
+              <input id="resPick" type="text" placeholder="搜索并选择 AI 模型 或 外部二进制…" autocomplete="off">
+              <div id="resDrop" class="oct-sel-drop" hidden></div>
             </div>
             <button class="mini" id="btnResRefresh" style="margin-top:8px">刷新</button>
             <div id="resEditBox">加载中…</div>
@@ -496,8 +484,7 @@
           <div class="card">
             <h2>插件依赖（隔离环境）</h2>
             <div class="lc-pick">
-              <input id="depPick" type="text" list="depPlugins" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
-              <datalist id="depPlugins"></datalist>
+              <input id="depPick" type="text" placeholder="搜索并选择插件名称或 ID…" autocomplete="off">
               <button class="mini" id="btnDepRefresh">刷新</button>
             </div>
             <div class="box" id="depArea">连接后加载…</div>
@@ -539,6 +526,8 @@
     </div>
   </div>
 
-    <script src="build/renderer.js"></script>
+    <!-- 共享「搜索+选择」组合框：与插件页同一份实现（权威源 resources/theme/octsel.js，构建时拷入 build/） -->
+  <script src="build/octsel.js"></script>
+  <script src="build/renderer.js"></script>
 </body>
 </html>

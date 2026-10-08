@@ -12,6 +12,9 @@ const $: (id: string) => any = (id) => document.getElementById(id);
 const setStatus = (t: string, c: string) => { $("status").textContent = t; $("status").className = "status " + c; };
 const rpc: (m: string, p?: any, t?: number) => Promise<any> = (m, p, t) => ipcRenderer.invoke("rpc", m, p, t) as Promise<any>;
 const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
+// 共享「搜索+选择」组合框（权威源 resources/theme/octsel.js，构建时拷入 build/octsel.js）：
+// 宿主设置页与各插件页引用同一份实现，此处仅作类型声明。
+declare const OctSelect: any;
 
     // ── 设置子窗口模式：读取 ?view=settings&sec=…，只显示对应那张设置卡片 ──
     // 说明：index.html 不做 auth/kport 自连内核；渲染脚本始终走 ipcRenderer.invoke("rpc") 由宿主主进程
@@ -41,7 +44,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
         if (typeof loadDepCfg === "function") loadDepCfg();
         if (typeof refreshOrderSettings === "function") refreshOrderSettings();
         if (typeof refreshMgmt === "function") refreshMgmt();
-        if (typeof wirePluginPicker === "function") wirePluginPicker();
+        if (typeof initPickers === "function") initPickers();
         if (typeof loadPerPluginList === "function") loadPerPluginList();
         if (typeof refreshFns === "function") refreshFns();
         if (typeof loadResources === "function") loadResources();
@@ -526,22 +529,29 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     }
     // 设置面板·单插件策略列表：每个插件一行汇总（模式/回收/重启/状态），点「编辑」展开编辑器
     const LC_INDEX: any = {}; // 插件显示名 -> id，供输入框解析
+    // 四处「搜索+选择」组合框实例（共享组件 build/octsel.js；插件页引用同一份实现）
+    let lcSel: any = null, psSel: any = null, depSel: any = null, resSel: any = null;
     // 选项文案：名称本身已含「（id）」时（如 能力网关（capability-gateway））不再重复追加 id，避免英文出现两遍
     function pluginLabel(p: any): string {
       const name = p.name || p.pluginId || "";
       if (name.includes(p.pluginId)) return name;
       return `${name}（${p.pluginId}）`;
     }
+    // 插件组合框的数据源与匹配规则（命中项按名称或 id 过滤）
+    function pluginItems() {
+      return (LC_INDEX.__all || []).map(p => ({ v: p.pluginId, label: pluginLabel(p) }));
+    }
+    const pluginMatch = (it: any, q: string) => it.label.toLowerCase().includes(q) || it.v.toLowerCase().includes(q);
     async function loadPerPluginList(preserveSel = undefined) {
       const input = $("lcPick");
       if (!input) return;
       try {
         const list = (await rpc("plugin.list", {})).plugins || [];
         LC_INDEX.__all = list;
-        refreshLcDrop();
+        if (lcSel) lcSel.refresh();
         // 保留之前选中
         if (preserveSel && input._sel) renderSinglePlugin(input._sel);
-      } catch (e) { refreshLcDrop(); }
+      } catch (e) { if (lcSel) lcSel.refresh(); }
     }
     // 输入框解析：支持「名称（id）」「id」「部分名称/id 前缀»，返回命中插件或 null
     function resolveLC(raw) {
@@ -578,109 +588,65 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       box.innerHTML = summary + `<div id="lceeds-sel"></div>`;
       await toggleLifecycleEditor(id, $("lceeds-sel"), true); // 选中即强制渲染表单
     }
-    // 自绘下拉（替代原生 datalist）：输入后命中的选项排在最前，其余全部照常展示（置灰），
-    // 避免原生 datalist 过滤掉未命中项导致找不到其他插件。
-    // 展开时机：仅输入框获得焦点时才展开（打开窗口/刷新列表不主动弹出）；
-    // 收回时机：鼠标脱离组合框（输入框+选项框）2s 自动收回。
-    let lcDropTimer: number | undefined;
-    function clearLcDropTimer() {
-      if (lcDropTimer) { clearTimeout(lcDropTimer); lcDropTimer = undefined; }
-    }
-    function armLcAutoClose() {
-      const dd = $("lcDrop");
-      if (!dd || dd.hidden) return;
-      clearLcDropTimer();
-      lcDropTimer = window.setTimeout(() => {
-        lcDropTimer = undefined;
-        const d = $("lcDrop");
-        if (d) d.hidden = true;
-      }, 2000);
-    }
-    function refreshLcDrop() {
-      const input = $("lcPick"), dd = $("lcDrop");
-      if (!input || !dd) return;
-      const all = LC_INDEX.__all || [];
-      const q = (input.value || "").trim().toLowerCase();
-      const hit: any[] = [], rest: any[] = [];
-      for (const p of all) {
-        const label = pluginLabel(p).toLowerCase();
-        const id = (p.pluginId || "").toLowerCase();
-        if (q && !label.includes(q) && !id.includes(q)) rest.push(p);
-        else hit.push(p);
+    // ── 「搜索+选择」组合框接线 ──
+    // 四处（单插件策略 / 插件内部设置 / 插件依赖 / 外部地址与内存设置）统一接到共享组件 OctSelect：
+    // 展开时机、鼠标脱离 2s 收回、命中置顶、清空 ✕、方向键全部由共享实现负责，
+    // 宿主这里只声明「选项数据源 + 选中/清空后的后果」。
+    function initPickers() {
+      if (lcSel) return; // 只挂一次（主窗与设置子窗各初始化一次也只挂一次）
+      if (typeof OctSelect === "undefined") {
+        console.error("[picker] 共享组合框未加载：build/octsel.js 缺失，请先在 ui 目录执行 npm run build");
+        return;
       }
-      const items = hit.concat(rest);
-      // 仅输入框聚焦时才展开；否则保持收起（窗口打开/刷新列表不得主动弹出）
-      const show = document.activeElement === input && items.length > 0;
-      dd.hidden = !show;
-      if (!show) { clearLcDropTimer(); return; }
-      dd.innerHTML = items.map((p, i) =>
-        `<div class="lc-dd-item${q && i < hit.length ? " hit" : ""}" data-id="${p.pluginId}">${pluginLabel(p)}</div>`
-      ).join("");
-      // 鼠标不在组合框内（如键盘聚焦打开）时，立即起 2s 收回计时
-      const box = input.closest(".lc-pick") as HTMLElement | null;
-      if (box && !box.matches(":hover")) armLcAutoClose();
-    }
-    // 组合框交互：输入联想（blur 解析、回车解析、自绘下拉点击/方向键选择）
-    function wirePluginPicker() {
-      const input = $("lcPick"), dd = $("lcDrop");
-      if (!input || !dd) return;
-      let curIdx = -1;
-      const pickEl = (el: any) => {
-        const p = (LC_INDEX.__all || []).find(x => x.pluginId === el.dataset.id);
-        if (!p) return;
-        input.value = pluginLabel(p);
-        input._sel = p.pluginId;
-        dd.hidden = true;
-        curIdx = -1;
-        renderSinglePlugin(p.pluginId);
-      };
-      const moveCur = (d: number) => {
-        const els = dd.querySelectorAll(".lc-dd-item");
-        if (!els.length) return;
-        curIdx = Math.max(0, Math.min(els.length - 1, curIdx + d));
-        els.forEach((e: any, i: number) => e.classList.toggle("cur", i === curIdx));
-        const el: any = els[curIdx];
-        if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
-      };
-      // 仅当解析出的插件与当前已渲染的不同时才重建表单。
-      // 避免点“保存/恢复”按钮时先触发 blur → 重建整个 box 替换按钮 → 吞掉该次点击。
-      const apply = () => {
-        const hit = resolveLC(input.value);
-        if (hit && hit.pluginId !== input._sel) renderSinglePlugin(hit.pluginId);
-      };
-      // 下拉点击：用 mousedown+preventDefault 抢在 blur 之前选择，避免 blur 先重建表单吞掉点击
-      dd.addEventListener("mousedown", (ev: any) => {
-        const el = (ev.target as HTMLElement).closest(".lc-dd-item");
-        if (!el) return;
-        ev.preventDefault();
-        pickEl(el);
+
+      lcSel = OctSelect.attach($("lcPick"), $("lcDrop"), {
+        items: pluginItems,
+        match: pluginMatch,
+        onPick: (it: any) => { $("lcPick")._sel = it.v; renderSinglePlugin(it.v); },
+        onCommit: () => {
+          // 仅当解析出的插件与当前已渲染的不同时才重建表单，
+          // 避免点“保存/恢复”按钮时 blur 先重建整个 box 替换按钮、吞掉该次点击。
+          const input = $("lcPick");
+          const hit = resolveLC(input.value);
+          if (hit && hit.pluginId !== input._sel) renderSinglePlugin(hit.pluginId);
+        },
+        onClear: () => { $("lcPick")._sel = null; const b = $("lcPerPluginBox"); if (b) b.innerHTML = ""; },
       });
-      input.addEventListener("focus", () => { curIdx = -1; refreshLcDrop(); });
-      input.addEventListener("input", () => { curIdx = -1; refreshLcDrop(); });
-      input.addEventListener("change", apply);
-      input.addEventListener("blur", () => { setTimeout(() => { dd.hidden = true; curIdx = -1; }, 120); apply(); });
-      input.addEventListener("keydown", (e: any) => {
-        if (e.key === "ArrowDown") { if (!dd.hidden) { e.preventDefault(); moveCur(1); } return; }
-        if (e.key === "ArrowUp") { if (!dd.hidden) { e.preventDefault(); moveCur(-1); } return; }
-        if (e.key === "Enter") {
-          if (!dd.hidden && curIdx >= 0) {
-            const el = dd.querySelectorAll(".lc-dd-item")[curIdx];
-            if (el) { e.preventDefault(); pickEl(el); return; }
-          }
-          apply();
-          return;
-        }
-        if (e.key === "Escape") { dd.hidden = true; curIdx = -1; return; }
+
+      psSel = OctSelect.attach($("psPick"), $("psDrop"), {
+        items: pluginItems,
+        match: pluginMatch,
+        onPick: (it: any) => renderPluginSettings(it.v),
+        onCommit: () => { const hit = resolveLC($("psPick").value); if (hit) renderPluginSettings(hit.pluginId); },
+        onClear: () => { const b = $("psArea"); if (b) b.innerHTML = '<span class="risk">请在上方选择插件。</span>'; },
       });
-      document.addEventListener("click", (ev: any) => {
-        if (!dd.hidden && !(ev.target as HTMLElement).closest(".lc-pick")) { dd.hidden = true; curIdx = -1; }
+
+      depSel = OctSelect.attach($("depPick"), $("depDrop"), {
+        items: pluginItems,
+        match: pluginMatch,
+        // 选中不立即动作：pid 由 depPluginId() 在点「预览依赖/安装」时按文本解析
+        onClear: () => { const b = $("depArea"); if (b) b.textContent = "连接后加载…"; },
       });
-      // 鼠标脱离组合框（输入框+选项框）2s 自动收回；回到框内即取消计时
-      const box = input.closest(".lc-pick") as HTMLElement | null;
-      if (box) {
-        box.addEventListener("mouseenter", clearLcDropTimer);
-        box.addEventListener("mouseleave", armLcAutoClose);
-      }
+
+      resSel = OctSelect.attach($("resPick"), $("resDrop"), {
+        items: () => (RS_INDEX.__all || []).map((x: any) => ({ v: x.key, label: `${x.label}（${x.key}）` })),
+        onPick: (it: any) => {
+          const input = $("resPick");
+          input._sel = it.v;
+          const hit = (RS_INDEX.__all || []).find((x: any) => x.key === it.v);
+          if (hit) renderResourceEditor(hit);
+        },
+        onCommit: () => {
+          const input = $("resPick");
+          const hit = resolveRes(input.value);
+          if (hit && hit.key !== input._sel) renderResourceEditor(hit);
+          input._sel = hit ? hit.key : null;
+        },
+        onClear: () => resetResEditor(),
+      });
+
+      const resRefresh = $("btnResRefresh");
+      if (resRefresh) resRefresh.onclick = () => loadResources(true);
     }
     // 全局预设：把 load_mode 批量应用到所有插件（保留用户对某个插件已设的其他覆盖）
     async function applyGlobalPreset(mode, opts) {
@@ -779,7 +745,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       refreshFns();
       refreshMgmt();
       refreshTools();
-      wirePluginPicker(); // 搜索+下拉选择交互（只挂一次，loadPerPluginList 只重建选项）
+      initPickers(); // 「搜索+选择」组合框接线（只挂一次，loadPerPluginList 只重建选项）
       loadPerPluginList();
       openDefaultPlugin(); // 启动后默认打开用户在设置中指定的插件页（默认 home）
       refreshOrderSettings(); // 填充「插件排序 · 默认页」配置卡片
@@ -933,27 +899,19 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       applySidebarOrder(); $("orderResult").textContent = "已保存并应用。下次启动默认打开：" + ($("defPageSel").value || "home");
     };
 
-    function depPluginsReady() {
-      const input = $("depPick"), dl = $("depPlugins");
-      if (!input) return false;
-      if (!$("depPlugins").innerHTML) {
-        const all = LC_INDEX.__all || [];
-        dl.innerHTML = all.map(p => `<option value="${pluginLabel(p)}"></option>`).join("");
-      }
-      return true;
-    }
+    // 「插件依赖」组合框的选项来自 LC_INDEX，刷新即重建下拉内容（不主动弹出）
+    function refreshDepPicker() { if (depSel) depSel.refresh(); }
 
     // ── §17.2 A · 插件/tool内部设置页（settingsSchema 驱动，非 schema 字段不得写入） ──
     // 表单由 manifest.settingsSchema.properties 派生：string/number/integer/boolean/enum → 对应控件。
     // 值默认取 effective.settings（user → defaults → 内置），保存时仅提交 schema 声明的键。
     async function loadPluginSettingsList() {
-      const input = $("psPick"), dl = $("psPlugins");
-      if (!input) return;
+      if (!$("psPick")) return;
       try {
         const list = (await rpc("plugin.list", {})).plugins || [];
         LC_INDEX.__all = list;
-        dl.innerHTML = list.map(p => `<option value="${pluginLabel(p)}"></option>`).join("");
-      } catch (e) { dl.innerHTML = ""; }
+      } catch (e) { /* 列表不可用时保持原有选项 */ }
+      if (psSel) psSel.refresh();
     }
     function schemaPropControl(key: string, prop: any, current: any) {
       const label = (prop && (prop.title || prop.description) || key);
@@ -1052,21 +1010,10 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       const res = document.createElement("pre"); res.id = "psResult"; res.className = "hint"; res.style.cssText = "font-size:12px;margin-top:8px;"; res.textContent = "当前生效值已预填，保存后仅写入 schema 覆盖字段。";
       box.appendChild(res);
     }
-    function wirePluginSettingsPicker() {
-      const input = $("psPick"); if (!input) return;
-      const apply = () => {
-        const hit = resolveLC(input.value);
-        if (hit) renderPluginSettings(hit.pluginId);
-      };
-      input.addEventListener("change", apply);
-      input.addEventListener("blur", apply);
-      input.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
-    }
-    if ($("psPick")) { loadPluginSettingsList(); wirePluginSettingsPicker(); }
+    if ($("psPick")) loadPluginSettingsList();
     $("btnDepRefresh").onclick = async () => {
-      $("depPlugins").innerHTML = "";
       try { const l = (await rpc("plugin.list", {})).plugins || []; LC_INDEX.__all = l; } catch (e) {}
-      depPluginsReady();
+      refreshDepPicker();
     };
     // 当前选中的依赖插件：支持「名称（id）」「id」「部分名称/id 前缀」
     function depPluginId() {
@@ -1075,7 +1022,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
       return (hit && hit.pluginId) || v;
     }
     $("btnDeps").onclick = async () => {
-      depPluginsReady();
+      refreshDepPicker();
       const pid = depPluginId();
       if (!pid) { $("depResult").textContent = "请先在“插件依赖”处选择或输入一个插件。"; return; }
       try {
@@ -1088,7 +1035,7 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
     };
 
     $("btnInstall").onclick = async () => {
-      depPluginsReady();
+      refreshDepPicker();
       const pid = depPluginId();
       if (!pid) { $("depResult").textContent = "请先在“插件依赖”处选择或输入一个插件。"; return; }
       $("depResult").textContent = "安装中…（" + pid + " · 首次/重装需数分钟，请耐心等待）";
@@ -1330,31 +1277,14 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
         } catch (e) { msg.textContent = "失败：" + e.message; btn.textContent = "保存"; }
       };
     }
-    function wireResPicker() {
-      const input = $("resPick");
-      if (!input || input._wired) return;
-      input._wired = true;
-      const apply = () => {
-        const hit = resolveRes(input.value);
-        if (hit && hit.key !== input._sel) renderResourceEditor(hit);
-        input._sel = hit ? hit.key : null;
-      };
-      input.addEventListener("change", apply);
-      input.addEventListener("blur", apply);
-      input.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
-      const refresh = $("btnResRefresh");
-      if (refresh) refresh.onclick = () => loadResources(true);
-    }
     async function loadResources(preserve = undefined) {
       const all = await resScan();
       RS_INDEX.__all = all;
-      const dl = $("resOpts");
-      if (dl) dl.innerHTML = all.map(x => `<option value="${x.label}（${x.key}）"></option>`).join("");
+      if (resSel) resSel.refresh();
       const sel = preserve && $("resPick") ? $("resPick")._sel : null;
       const cur = sel ? all.find(x => x.key === sel) : null;
       if (cur) { renderResourceEditor(cur); }
       else { resetResEditor(); }
-      wireResPicker();
     }
 
     ipcRenderer.on("kernel:error", (e, err) => { setStatus("启动失败", "err"); });

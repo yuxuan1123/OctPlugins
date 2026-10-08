@@ -55,6 +55,12 @@ func Run(root string) error {
 		uvBin = "uv"
 	}
 	installer := runtime.New(root, uvBin)
+	// 随包分发的托管解释器（resources/runtime/python）：令 uv 以包内目录为解释器根，
+	// 使 `uv venv` / `uv python find` 命中包内解释器，而不是用户 AppData（换机不丢）。
+	if bp := installer.BundledPython(); bp != "" {
+		_ = os.Setenv("UV_PYTHON_INSTALL_DIR", installer.BundledPythonDir())
+		log.Printf("[kernel] bundled python: %s", bp)
+	}
 	// 依赖源设置优先级：UI 持久化配置(state/runtime.json) 为基础，环境变量临时覆盖。
 	installer.UseConfigFile(filepath.Join(storeDir, "runtime.json"))
 	if err := installer.LoadConfig(); err != nil {

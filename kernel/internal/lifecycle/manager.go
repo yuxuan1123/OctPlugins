@@ -101,41 +101,41 @@ type reg struct {
 	mu      sync.Mutex
 	state   RegState
 	running *Plugin
-	crash   []time.Time   // 滑动窗口内崩溃时间戳（退避重启依据）
+	crash   []time.Time // 滑动窗口内崩溃时间戳（退避重启依据）
 }
 
 type Manager struct {
-	mu         sync.Mutex
-	pluginsDir string
-	storeDir   string
-	regStore   *registry.Store // §8：registry.json 唯一写入方（app 注入后启用）
-	regs       map[string]*reg
-	overrides  overridesFile // 用户覆盖 map[pluginID]Override（持久化 state/overrides.json）
-	pythonPath string
-	gate       *perms.Gate
-	venvPython func(Manifest) string
-	depsReady  func(Manifest) bool // Python 依赖就绪判定（RequirementsSatisfied）；nil 时默认就绪
-	nodeBin    func(Manifest) (string, bool)
-	sdkPyPath  string                                                          // §16.5：oct_sdk 根（root/sdk/python），spawn 经 PYTHONPATH 注入
-	depsPlan   func(Manifest) (jsonHash, lockHash, cacheDir string, err error) // §6/§8：spawn 前锁判定并入 registry
-	install    func(Manifest, func(phase string)) error                        // §6.4：真实依赖安装（Installer.Install）+ 进度回调
-	onSpawn    func(*Plugin)                                                   // 注入 Event 广播出口（内核装配）
-	onState    func(id, state string)                                          // 进程状态变更回调（内核装配→宿主刷新 UI）
-	onDepsProg  func(id, phase string)                                          // §6.4：依赖安装进度回调（内核装配→宿主广播）
-	onModelEvt  func(typ string, data any)                                     // 转化域 §12.5：模型 handover 事件（内核装配→宿主广播）
-	pinsFn      func() map[string]string                                       // 转化域 §8.1：用户能力级 pin 读取器（装配根注入）
-	pinWriteFn  func(capability, modelID string) error                         // 转化域 §8.1：pin 写入器（装配根注入，落 user-settings.json）
-	settingsGetFn func(pluginID string, mf Manifest) (map[string]any, error)                 // §17.2 A：插件读自己的生效设置（装配根注入）
-	settingsSetFn func(pluginID string, mf Manifest, settings map[string]any) error        // §17.2 A：插件写自己的设置（装配根注入）
-	tokenGen   func() string                                                   // §11.4：每次 spawn 一次性生成握手 token（默认 crypto/rand hex）
+	mu            sync.Mutex
+	pluginsDir    string
+	storeDir      string
+	regStore      *registry.Store // §8：registry.json 唯一写入方（app 注入后启用）
+	regs          map[string]*reg
+	overrides     overridesFile // 用户覆盖 map[pluginID]Override（持久化 state/overrides.json）
+	pythonPath    string
+	gate          *perms.Gate
+	venvPython    func(Manifest) string
+	depsReady     func(Manifest) bool // Python 依赖就绪判定（RequirementsSatisfied）；nil 时默认就绪
+	nodeBin       func(Manifest) (string, bool)
+	sdkPyPath     string                                                            // §16.5：oct_sdk 根（root/sdk/python），spawn 经 PYTHONPATH 注入
+	depsPlan      func(Manifest) (jsonHash, lockHash, cacheDir string, err error)   // §6/§8：spawn 前锁判定并入 registry
+	install       func(Manifest, func(phase string)) error                          // §6.4：真实依赖安装（Installer.Install）+ 进度回调
+	onSpawn       func(*Plugin)                                                     // 注入 Event 广播出口（内核装配）
+	onState       func(id, state string)                                            // 进程状态变更回调（内核装配→宿主刷新 UI）
+	onDepsProg    func(id, phase string)                                            // §6.4：依赖安装进度回调（内核装配→宿主广播）
+	onModelEvt    func(typ string, data any)                                        // 转化域 §12.5：模型 handover 事件（内核装配→宿主广播）
+	pinsFn        func() map[string]string                                          // 转化域 §8.1：用户能力级 pin 读取器（装配根注入）
+	pinWriteFn    func(capability, modelID string) error                            // 转化域 §8.1：pin 写入器（装配根注入，落 user-settings.json）
+	settingsGetFn func(pluginID string, mf Manifest) (map[string]any, error)        // §17.2 A：插件读自己的生效设置（装配根注入）
+	settingsSetFn func(pluginID string, mf Manifest, settings map[string]any) error // §17.2 A：插件写自己的设置（装配根注入）
+	tokenGen      func() string                                                     // §11.4：每次 spawn 一次性生成握手 token（默认 crypto/rand hex）
 
-	resources *resources.Manager // §14 ResourceMap（extern deps 登记/获取/释放）
-	toolsRoot string             // §14.2 tools/ 根（bundled 定位用）
-	modelsRoot string            // 转化域 §20.5：模型存储根（空 = DefaultModelsRoot）
+	resources  *resources.Manager // §14 ResourceMap（extern deps 登记/获取/释放）
+	toolsRoot  string             // §14.2 tools/ 根（bundled 定位用）
+	modelsRoot string             // 转化域 §20.5：模型存储根（空 = DefaultModelsRoot）
 
 	patrolOnce sync.Once // §12.2.3：健康巡检单 goroutine（全插件共享），once 防重复启动
 
-	stOnce sync.Once // §12.2.2 状态机单 goroutine（once 防重复启动）
+	stOnce sync.Once     // §12.2.2 状态机单 goroutine（once 防重复启动）
 	stEvCh chan *stEvent // §12.2.2 状态迁移事件汇入唯一 state-loop goroutine
 
 	fnsMu sync.Mutex
@@ -321,7 +321,9 @@ func isGoType(t string) bool {
 
 // pluginReady 判断插件是否可启动（依赖是否就绪）。
 // Node：需 node 解释器可用 且 node_modules 依赖就绪（depsReady）才就绪，
-//       否则走 §6.4 后台安装 gating（package.json 有依赖但未装 node_modules → 触发 pnpm 安装）；
+//
+//	否则走 §6.4 后台安装 gating（package.json 有依赖但未装 node_modules → 触发 pnpm 安装）；
+//
 // Python：需已注入的就绪判定通过（默认通过，等价旧行为）。
 func (m *Manager) pluginReady(mf Manifest) bool {
 	// Go 编译型插件：二进制已随包分发，无解释器/依赖安装步骤，直接就绪。
@@ -409,6 +411,18 @@ func (m *Manager) emitDepsProgress(id, phase string) {
 	if fn != nil {
 		go fn(id, phase)
 	}
+}
+
+// triggerDepsInstall §6.4 依赖后台安装触发（幂等：同一插件已有安装在途时不重复触发）。
+// 返回 true 表示本次调用新启动了安装。安装完成后由 depsInstallThenStart 自动续启。
+func (m *Manager) triggerDepsInstall(r *reg) bool {
+	if !r.markInstalling() {
+		return false
+	}
+	m.setDepsState(r.id, "preparing")
+	m.emitState(r, "PREPARING")
+	go m.depsInstallThenStart(r)
+	return true
 }
 
 // depsInstallThenStart §6.4 后台安装完成后的续启：成功 → depsState=ready 并重新触发启动；
@@ -858,6 +872,8 @@ func (m *Manager) SetLifecycle(id string, ov Override) error {
 }
 
 // GetOrStart 按需启动（懒启动核心）。running→直接返回；starting→等待；idle/stopped→重新 spawn。
+// §6.4：依赖未就绪时不硬失败，而是触发后台安装并返回 ErrDepsInstalling（ring/call 路径同样
+// 能自愈 —— 精简分发包首启用例：venv 未随包分发，首次调用即自动联网安装，装完自动续启）。
 func (m *Manager) GetOrStart(id string) (*Plugin, error) {
 	r := m.getReg(id)
 	if r == nil {
@@ -868,10 +884,8 @@ func (m *Manager) GetOrStart(id string) (*Plugin, error) {
 	}
 	// 登记阶段未探测依赖，这里按需判定（带超时），保持 lazy/prewarm 的就绪门槛不变。
 	if !m.pluginReady(r.mf) {
-		r.mu.Lock()
-		r.depsPending = true
-		r.mu.Unlock()
-		return nil, fmt.Errorf("plugin %s dependencies not installed", r.id)
+		m.triggerDepsInstall(r)
+		return nil, ErrDepsInstalling
 	}
 	return m.startNow(r)
 }
@@ -1030,19 +1044,10 @@ func (m *Manager) loopSpawn(r *reg) (*Plugin, error) {
 	// §6.4 依赖 gating：未就绪 → depsState=preparing + 后台安装（不阻塞 stateLoop/其他插件），
 	// 安装完成后自动续启；当前以 ErrDepsInstalling 返回，插件置 held(IDLE) 待续启。
 	if !m.pluginReady(r.mf) {
-		if r.markInstalling() {
-			m.setDepsState(r.id, "preparing")
-			r.mu.Lock()
-			r.state = RegIdle
-			r.mu.Unlock()
-			m.emitState(r, "PREPARING")
-			go m.depsInstallThenStart(r)
-		} else {
-			// 已有一个后台安装在途：保持 held，等它完成后统一续启（不重复安装）。
-			r.mu.Lock()
-			r.state = RegIdle
-			r.mu.Unlock()
-		}
+		r.mu.Lock()
+		r.state = RegIdle
+		r.mu.Unlock()
+		m.triggerDepsInstall(r)
 		return nil, ErrDepsInstalling
 	}
 	m.setDepsState(r.id, "ready")
@@ -1552,6 +1557,14 @@ func (m *Manager) FuncList() []Fn {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// FuncOwner 返回共享函数所属插件 ID（不存在返回空串）。用于把调用失败映射到
+// 具体插件（如依赖安装中 → 携带 pluginId 的错误）。
+func (m *Manager) FuncOwner(name string) string {
+	m.fnsMu.Lock()
+	defer m.fnsMu.Unlock()
+	return m.fns[name].PluginID
 }
 
 // CallFunc 按共享函数名路由到所属插件执行（懒启动：未运行先 GetOrStart）。

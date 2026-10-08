@@ -52,6 +52,8 @@ kernel/internal/deps/
 state/
 config/
 runtime/
+# 插件配置目录：含 CHECKIN_TOKEN 等凭据，禁止入库
+store/
 *.tmp
 
 # 用户插件目录：一律不入库（第三方/本地安装均排除）

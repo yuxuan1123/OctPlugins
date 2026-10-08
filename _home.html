@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <!-- TDK start -->
+  <meta name="description"
+        content="薪人薪事是数据驱动“人效提升”的智能数据化HR SaaS服务平台,致力于帮助企业提升人力资源管理能力,激发组织员工和工作活力,全面提升人才管理效能"/>
+  <meta name="keyword"
+        content="薪人薪事登录,薪人薪事网页登录,薪人薪事网页版登录,薪人薪事人事系统登录,薪人薪事saas系统登录,人事系统登录,人事saas系统登录,薪人薪事登陆,薪人薪事网页登陆,薪人薪事网页版登陆,薪人薪事人事系统登陆,薪人薪事saas系统登陆,人事系统登陆,人事saas系统登陆"/>
+  <!-- TDK end -->
+  <meta charset="utf-8"/>
+  <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+  <!-- <meta name="viewport" content="width=device-width,initial-scale=1.0" /> -->
+  <meta name="viewport" content="width=device-width,minimum-scale=1.0,maximum-scale=1.0,user-scalable=no">
+  <script>
+    window.CICD_ENV = 'online' || ''
+    window.PRIVATE_DEPLOY = '' || ''
+    window.XrxsPlatform = 'EMP'
+    var moduleName = 'staff';
+
+    // 埋点用
+    sessionStorage.setItem('xrxsTrackerBelongsModule', '员工PC')
+
+    window.__listenerScriptLoadCache__ = [];
+    window.PRIVATE_DEPLOY !=='true' && window.addEventListener('error', function (event) {
+      try {
+        if (!event) {
+          return;
+        }
+        var __script_error_target = event.target || event.srcElement;
+        var __isElementTarget = __script_error_target instanceof HTMLScriptElement || __script_error_target instanceof HTMLLinkElement || __script_error_target instanceof HTMLImageElement;
+        if (!__isElementTarget) {
+          return;
+        }
+        var __script_error = {
+          level: __script_error_target.tagName.toUpperCase() === 'IMG' ? 'warning' : 'fatal',
+          message: '加载 ' + __script_error_target.tagName + ' 资源错误 URL：' + __script_error_target.src || __script_error_target.href,
+          url: __script_error_target.src || __script_error_target.href,
+          times: new Date().getTime()
+        };
+        if (window.XrxsSentry && window.XrxsSentry.uploadScriptLoadError) {
+          window.XrxsSentry.uploadScriptLoadError(__script_error)
+        } else {
+          if (!window.__listenerScriptLoadCache__) {
+            window.__listenerScriptLoadCache__ = [];
+          }
+          window.__listenerScriptLoadCache__.push(__script_error);
+        }
+      } catch (error) {
+        console.log('资源加载收集异常', error);
+      }
+
+    }, true)
+  </script>
+  <link
+    rel="shortcut icon"
+    href="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/favicon.ico"
+    type="image/x-icon"
+  />
+  <!-- 未压缩版本 vue 可以调起 vue devtool -->
+  <script
+    src="//static.xinrenxinshi.com/plugins/vue.min-2.7.16.js"></script>
+  <script src="//static.xinrenxinshi.com/plugins/loghub-tracking-0.6.0.js" async></script>
+  <!-- 腾讯CoDesign 图标库 -->
+  <script src="//static.xinrenxinshi.com/resources/2022/icons/1779178071057/iconfont.js"></script>
+  <!-- 引入样式 -->
+  <link rel="stylesheet" href="//static.xinrenxinshi.com/plugins/elementui-2.8.2/element-ui-2.8.2.min.css"/>
+  <!-- wangEditor -->
+  <script src="//static.xinrenxinshi.com/plugins/wangEditor.min.js"></script>
+  <!-- 阿里 G6 -->
+  <script src="//static.xinrenxinshi.com/plugins/g6-4.2.6.min.js"></script>
+  <!-- handsontable -->
+  <script src="//static.xinrenxinshi.com/storm/handsontable.full.6.2.2.min.js"></script>
+  <link rel="stylesheet" href="//static.xinrenxinshi.com/plugins/handsontable.full.min.css"/>
+  <!-- 引入组件库 -->
+  <script src="//static.xinrenxinshi.com/plugins/elementui-2.8.2/element-ui-2.8.2.min.js"></script>
+  <script src="//static.xinrenxinshi.com/plugins/elementui-2.8.2/locale/en.js"></script>
+  <script type="text/javascript" src="//static.xinrenxinshi.com/plugins/jquery-3.6.0.min.js"></script>
+  <link rel="stylesheet" href="//static.xinrenxinshi.com/plugins/vue-pdf-reader/vue-pdf-reader-0.2.13.min.css">
+  <script src="//static.xinrenxinshi.com/plugins/vue-pdf-reader/vue-pdf-reader-0.2.13.min.js"></script>
+
+  <!--gdMap-->
+  <script type="text/javascript">
+    window._AMapSecurityConfig = {
+        securityJsCode:'116fbb3caa0ab9d7eb39e336b7280a89',
+    }
+  </script>
+  <script type="text/javascript" src="//webapi.amap.com/maps?v=2.0&key=802a57db53c69c09ef45062a6db18730"></script>
+  <!-- iconfont 开发测试阶段可以用iconfont提供的cdn地址，线上必须上传oss改为阿里云的cdn地址-->
+  <script src="//static.xinrenxinshi.com/resources/2022/iconfont/font_1311853_cnmmbjna2nl/iconfont.js"></script>
+
+  <!--	旧版iconfont  -->
+  <script src="//static.xinrenxinshi.com/plugins/old-iconfont/iconfont.js"></script>
+  <!--    皮肤文件-->
+  <script src="//static.xinrenxinshi.com/plugins/el-skin.js"></script>
+  <!-- cherry-markdown -->
+  <link rel="stylesheet" href="//static.xinrenxinshi.com/plugins/cherry-markdown%400.8.40/dist/cherry-markdown.min.css"/>
+  <!-- 多语言相关引用, 区分开发环境和线上环境 -->
+  
+  <script src="//static.xinrenxinshi.com/resources/2022/xin-i18n/v2.4.5/xin-i18n.min.js"></script>
+  <script src="//static.xinrenxinshi.com/resources/i18n/unicorn-staff/xrxsInternational.js?v=1790680828163"></script>
+  
+  <!-- header搜索低代码维护的路由 -->
+  
+  <script src="//static.xinrenxinshi.com/resources/homeSearchJson/xrxsHomeSearchJson.js"></script>
+  
+  <script>
+    window.XinI18n.create()
+  </script>
+  <!--    皮肤文件-->
+  <script src="//static.xinrenxinshi.com/plugins/el-skin.js"></script>
+  <!--    引入模块基础逻辑-->
+  
+  <script src="//static.xinrenxinshi.com/resources/2022/xin-infra/xin-infra.umd.min.js?v=1790680828163"></script>
+  
+  <!-- echarts -->
+  <script src="//static.xinrenxinshi.com/plugins/echarts-5.1.2.min.js"></script>
+  <script src="//static.xinrenxinshi.com/plugins/mathjs%4013.0.3/math.js"></script>
+  <style type="text/css">
+    .icon-font {
+      width: 1em;
+      height: 1em;
+      vertical-align: -0.15em;
+      fill: currentColor;
+      overflow: hidden;
+    }
+
+    [v-cloak] {
+      display: none;
+    }
+
+    .module-body {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+  <script>
+    // navigator.sendBeacon = navigator.sendBeacon ||
+    //     new Function('var r = new XMLHttpRequest();r.open("POST",arguments[0],true);r.send(arguments[1]);');
+
+    if (typeof Object.assign != 'function') {
+      Object.assign = function (target) {
+        'use strict';
+        if (target == null) {
+          throw new TypeError('Cannot convert undefined or null to object');
+        }
+
+        target = Object(target);
+        for (var index = 1; index < arguments.length; index++) {
+          var source = arguments[index];
+          if (source != null) {
+            for (var key in source) {
+              if (Object.prototype.hasOwnProperty.call(source, key)) {
+                target[key] = source[key];
+              }
+            }
+          }
+        }
+        return target;
+      };
+    }
+
+    // generator uuid
+    var _generatorUUID = function () {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+        var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+
+    var holdDefault = function (e) {
+      e = e || window.event;
+      var cur = e.target || e.relatedTarget || e.srcElement || e.currentTarget;
+      if (e.keyCode == 8 && cur.tagName != 'INPUT' && cur.tagName != 'TEXTAREA' && !cur.isContentEditable && cur.readOnly !== false) {
+        if (e.preventDefault) {
+          e.preventDefault();
+        } else {
+          e.returnValue = false;
+          return false;
+        }
+      }
+    };
+    try {
+      if (window.addEventListener) {
+        window.addEventListener('keydown', holdDefault);
+      } else if (window.attachEvent) {
+        window.attachEvent('onkeydown', holdDefault);
+      }
+    } catch (e) {
+      console.error('holdDefault info:', e.message);
+    }
+    /**
+     * 在Safari和IE8上执行 new Date('2017-12-8 11:36:45'); 会得到Invalid Date
+     * 本函数重写默认的Date函数，以解决其在Safari，IE8上的bug
+     */
+    window.UnitDate = function (Date) {
+      MyDate.prototype = Date.prototype;
+
+      function MyDate() {
+        // 当只有一个参数并且参数类型是字符串时，把字符串中的-替换为/
+        if (arguments.length === 1) {
+          var arg = arguments[0];
+          if (Object.prototype.toString.call(arg) === '[object String]' && arg.indexOf('T') === -1) {
+            arguments[0] = arg.replace(/-/g, '/');
+          }
+        }
+        var bind = Function.bind;
+        var unbind = bind.bind(bind);
+        return new (unbind(Date, null).apply(null, arguments))
+      }
+
+      return MyDate;
+    }(Date)
+    ELEMENT.Dialog.props.closeOnClickModal.default = false;
+  </script>
+<link rel="icon" href="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/favicon.ico"><title>员工PC</title><script defer src="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/js/chunk-xinui.1404e1fd.js"></script><script defer src="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/js/chunk-vendors-0.3c664328.js"></script><script defer src="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/js/chunk-vendors-1.f91e2dd5.js"></script><script defer src="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/js/chunk-vendors-2.aea193ae.js"></script><script defer src="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/js/chunk-common.a19b1948.js"></script><script defer src="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/js/staff.174e9aff.js"></script><link href="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/css/chunk-vendors-3.17c8b573.css" rel="stylesheet"><link href="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/css/chunk-vendors-4.043cc205.css" rel="stylesheet"><link href="//static.xinrenxinshi.com/resources/2022/unicorn-staff/20260929192026/unicorn/css/staff.9714d20e.css" rel="stylesheet"></head>
+
+<body>
+<noscript>
+  <strong
+  >We're sorry but steam doesn't work properly without JavaScript enabled.
+    Please enable it to continue.</strong
+  >
+</noscript>
+<div class="module-body" id="staff">
+  <xin-layout min-width="">
+    <router-view></router-view>
+  </xin-layout>
+  <div v-if="showCustomerServiceEntry" id="customer-service-entry" class="c_pointer">
+  <div
+    class="right-sidebar-container"
+    @mouseenter="changeCustomerServiceActive($event)"
+    @mouseleave="removeCustomerServiceActive($event)"
+  >
+    <xin-customer-service-gpt/>
+  </div>
+</div>
+
+</div>
+<!-- cherry-markdown -->
+</body>
+
+</html>

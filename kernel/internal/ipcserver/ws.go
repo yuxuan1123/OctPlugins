@@ -3,6 +3,7 @@ package ipcserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -565,7 +566,7 @@ func (s *Server) handlePluginStart(conn *websocket.Conn, req protocol.Request) {
 	}
 	_ = json.Unmarshal(req.Params, &p)
 	if _, err := s.smanager.GetOrStart(p.PluginID); err != nil {
-		s.reply(conn, protocol.NewError(req.ID, protocol.ErrPluginDown, map[string]any{"error": err.Error()}))
+		s.replySpawnErr(conn, req, p.PluginID, err, protocol.ErrPluginDown)
 		return
 	}
 	s.reply(conn, protocol.NewResult(req.ID, map[string]any{"pluginId": p.PluginID, "started": true}))
@@ -766,11 +767,11 @@ func (s *Server) handleCall(conn *websocket.Conn, req protocol.Request) {
 		return
 	}
 	// 懒启动：未运行（lazy/prewarm 或已回收）则先按需拉起，再派发请求。
+	// 依赖未就绪时分两种情况：已触发后台安装 → E_DEPS_MISSING(installing=true) 提示等待；
+	// 其余启动失败 → E_PLUGIN_DOWN（保持旧语义）。
 	pl, gerr := s.smanager.GetOrStart(p.PluginID)
 	if gerr != nil {
-		s.reply(conn, protocol.NewError(req.ID, protocol.ErrPluginDown, map[string]any{
-			"pluginId": p.PluginID, "error": gerr.Error(),
-		}))
+		s.replySpawnErr(conn, req, p.PluginID, gerr, protocol.ErrPluginDown)
 		return
 	}
 	if !pl.Alive() {
@@ -957,6 +958,22 @@ func (s *Server) handleRegistryList(conn *websocket.Conn, req protocol.Request) 
 	s.reply(conn, protocol.NewResult(req.ID, map[string]any{"functions": funcs}))
 }
 
+// replySpawnErr 把懒启动失败映射为协议错误：依赖未就绪（已触发后台安装）→
+// E_DEPS_MISSING(-32007) 并带 installing=true，宿主可据此提示“正在安装依赖”而非
+// 误报“插件不存在”；其余错误回落到调用方给定的码。
+func (s *Server) replySpawnErr(conn *websocket.Conn, req protocol.Request, pluginID string, err error, fallback int) {
+	data := map[string]any{"error": err.Error()}
+	if pluginID != "" {
+		data["pluginId"] = pluginID
+	}
+	if errors.Is(err, lifecycle.ErrDepsInstalling) {
+		data["installing"] = true
+		s.reply(conn, protocol.NewError(req.ID, protocol.ErrDepsMissing, data))
+		return
+	}
+	s.reply(conn, protocol.NewError(req.ID, fallback, data))
+}
+
 // registry.call 宿主按共享函数名调用（内核路由到所属插件）。
 func (s *Server) handleRegistryCall(conn *websocket.Conn, req protocol.Request) {
 	var p struct {
@@ -978,7 +995,7 @@ func (s *Server) handleRegistryCall(conn *websocket.Conn, req protocol.Request) 
 	}
 	resp, err := s.smanager.CallFunc(p.Name, params, timeout)
 	if err != nil {
-		s.reply(conn, protocol.NewError(req.ID, protocol.ErrPluginMissing, map[string]any{"error": err.Error()}))
+		s.replySpawnErr(conn, req, s.smanager.FuncOwner(p.Name), err, protocol.ErrPluginMissing)
 		return
 	}
 	if resp.Error != nil {

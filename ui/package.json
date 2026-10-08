@@ -4,8 +4,8 @@
   "description": "OctPlugins Electron 宿主（拉起 Go 内核 + WS 连接）",
   "main": "build/main.js",
   "scripts": {
-    "build": "tsc",
-    "start": "tsc && electron ."
+    "build": "tsc && node -e \"require('fs').copyFileSync('../resources/theme/octsel.js','build/octsel.js')\"",
+    "start": "npm run build && electron ."
   },
   "devDependencies": {
     "electron": "^31.0.0",
