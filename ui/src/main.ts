@@ -5,7 +5,7 @@
 //   4) 调 plugin.list → 结果在窗口显示。
 export {};
 
-const { app, BrowserWindow, dialog, ipcMain, globalShortcut, Tray, Menu, nativeImage, clipboard, screen } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, globalShortcut, Tray, Menu, nativeImage, clipboard, screen, webContents, session } = require("electron");
 const { spawn, execFile } = require("child_process");
 const fs = require("fs");
 const os = require("os");
@@ -44,6 +44,9 @@ let toolLastEvent = null;
 // 路由（tool 发的内核事件要投给哪个 overlay 窗）。
 const overlayWindows: Map<string, InstanceType<typeof BrowserWindow>> = new Map();
 const overlayRoute: Map<string, InstanceType<typeof BrowserWindow>> = new Map(); // toolId → overlay window
+// 曾开过 overlay 的 toolId：miss 日志只对这些 source 警示（普通窗口插件如 oim 不注册 overlay，
+// 事件走 toolSubs 订阅通道，overlay miss 属预期噪音，不打日志）。
+const overlaySeen: Set<string> = new Set();
 
 // 宿主主进程侧不直接 require 任何 .node，也不持有 overlay 取色逻辑。取色等能力由
 // napi_rs_tool 经插件进程通道提供；放大镜 overlay 是 kind:"overlay" 插件，由宿主把其 ui 页
@@ -136,6 +139,7 @@ async function openOverlayInternal(pluginId: string, opts: any = {}) {
   ovWin.loadFile(file, { query: { persistent: opts.persistent ? "1" : "" } });
   overlayWindows.set(pluginId, ovWin);
   if (toolId) overlayRoute.set(toolId, ovWin);
+  if (toolId) overlaySeen.add(toolId);
   return { ok: true };
 }
 // 关闭并注销 overlay 窗口（ipc 与主进程内部编排共用）。
@@ -194,6 +198,152 @@ function spawnPluginWindow(full: string, opts: any) {
   sub.loadURL(full);
   return sub;
 }
+
+// ── 内嵌浏览器（browser 插件）────────────────────────────────────────
+// 浏览器 UI 是主窗内的静态面板 #panel-plugin.browser（ui/index.html），
+// 由 ui/browser-panel.js 在主窗渲染进程里直接管理 <webview>。
+// 必须内嵌的原因：<webview> 不能在 iframe 内创建，所以标签栏与页面只能住在宿主渲染进程。
+// 主进程只做三件事：切到该面板、把 browser.open 转成 browser:tab-open、装钩子并回传加载结果。
+const pendingTasks: Map<string, any> = new Map(); // taskId -> 进行中的任务
+const attachedWc = new WeakSet<any>();
+
+// 确保主窗可见并切到浏览器面板（不再创建独立窗口）。
+function ensureBrowserWindow(): Promise<any> {
+  if (win && !win.isDestroyed()) {
+    if (!win.isVisible()) win.show();
+    win.focus();
+    win.webContents.send("ui:switch-panel", "plugin.browser");
+  }
+  return Promise.resolve(win);
+}
+
+// 浏览器事件一律投给主窗渲染进程。
+// 默认**不切面板**：定时任务/后台打开不该把用户从 OIM、翻译等插件里拽走；
+// 只有显式要求可见（activate=true）或用户主动点击（window.open、/browser）时才切。
+function browserSend(channel: string, payload: any, opts: any = {}): Promise<void> {
+  if (win && !win.isDestroyed()) {
+    if (opts.switchPanel !== false) win.webContents.send("ui:switch-panel", "plugin.browser");
+    win.webContents.send(channel, payload);
+  }
+  return Promise.resolve();
+}
+
+// 让壳关闭标签（按 tabId 或 taskId 匹配）。壳侧 browser-panel.js 监听 browser:close-tab。
+function closeBrowserTab(q: any) {
+  if (win && !win.isDestroyed()) win.webContents.send("browser:close-tab", q || {});
+}
+
+async function reportWebTask(pluginId: string, data: any) {
+  try {
+    await rpc("plugin.call", { pluginId, method: "browser.report", params: data, timeoutMs: 20000 }, 22000);
+  } catch (e: any) {
+    console.warn("[browser] 结果回传失败（插件可能未运行）", (e && e.message) || e);
+  }
+}
+
+// 定时/手动任务：在真实浏览器里开一个标签页，加载完成即回传结果（插件据此写日志）。
+// payload: {taskId,name,url,activate,reportTo,reason}
+async function openBrowserTab(payload: any, meta: any = {}) {
+  const p = payload || {};
+  const taskId = String(p.taskId || "task-" + Date.now());
+  const pluginId = String(p.reportTo || meta.source || "browser");
+  const url = String(p.url || "").trim();
+  const startedAt = Date.now();
+
+  if (!/^https?:\/\//i.test(url)) {
+    await reportWebTask(pluginId, {
+      taskId, name: p.name || "", url, ok: false,
+      error: "网址必须以 http(s):// 开头", ms: 0,
+    });
+    return { ok: false };
+  }
+
+  // 加载超时只记日志，不打扰已经打开的标签（用户还可以继续用）。
+  const timer = setTimeout(() => {
+    const t = pendingTasks.get(taskId);
+    if (!t) return;
+    pendingTasks.delete(taskId);
+    reportWebTask(t.pluginId, {
+      taskId, name: t.name, url, ok: false,
+      error: "页面加载超时", ms: Date.now() - t.startedAt,
+    });
+  }, 60000);
+
+  pendingTasks.set(taskId, { pluginId, name: p.name || "", startedAt, timer });
+  browserSend("browser:tab-open", { taskId, url, activate: !!p.activate }, { switchPanel: !!p.activate });
+  return { ok: true };
+}
+
+// 浏览器壳在标签页加载完成后通知：回传标题/最终地址，插件据此写日志。
+ipcMain.on("browser:tab-ready", (e: any, d: any = {}) => {
+  const taskId = String(d.taskId || "");
+  const t = pendingTasks.get(taskId);
+  if (!t) return;
+  clearTimeout(t.timer);
+  pendingTasks.delete(taskId);
+
+  const wc = webContents.fromId(Number(d.webContentsId));
+  let title = "", finalUrl = "";
+  try { title = wc ? wc.getTitle() : ""; finalUrl = wc ? wc.getURL() : ""; } catch (err) { /* ignore */ }
+
+  reportWebTask(t.pluginId, {
+    taskId, name: t.name, url: finalUrl || "", title, ok: true,
+    ms: Date.now() - t.startedAt,
+  });
+});
+
+// 浏览器面板首次显示时拉取自启动清单：转发到 browser 插件的 startup.list。
+// 走 plugin.call 而不是事件，避免「内核先启动、面板后显示」导致事件丢失。
+ipcMain.handle("browser:startup-list", async () => {
+  try {
+    const r: any = await rpc(
+      "plugin.call",
+      { pluginId: "browser", method: "startup.list", params: {} },
+      12000,
+    );
+    return r && Array.isArray(r.urls) ? r.urls : [];
+  } catch (e) {
+    return [];
+  }
+});
+
+// 浏览器壳创建 <webview> 后登记：接管 window.open（新窗口一律变成新标签），
+// 并把壳内快捷键（Ctrl+T/W/L、F5、Alt+←/→）转给壳处理。
+ipcMain.handle("browser:attach", (e: any, p: any = {}) => {
+  const wc = webContents.fromId(Number(p.webContentsId));
+  if (!wc) return { ok: false };
+  if (!attachedWc.has(wc)) {
+    attachedWc.add(wc);
+    try {
+      wc.setWindowOpenHandler(({ url }: any) => {
+        if (/^https?:/i.test(url)) browserSend("browser:open-tab", { url, activate: true });
+        return { action: "deny" };
+      });
+    } catch (err) { /* ignore */ }
+    wc.on("before-input-event", (event: any, input: any) => {
+      if (!input || input.type !== "keyDown") return;
+      const ctrl = input.control || input.meta;
+      const key = String(input.key || "").toLowerCase();
+      let act = "";
+      if (ctrl && key === "t") act = "new-tab";
+      else if (ctrl && key === "w") act = "close-tab";
+      else if (ctrl && key === "l") act = "focus-addr";
+      else if (input.key === "F5" || (ctrl && key === "r")) act = "reload";
+      else if (input.alt && input.key === "ArrowLeft") act = "back";
+      else if (input.alt && input.key === "ArrowRight") act = "forward";
+      if (act) { event.preventDefault(); browserSend("browser:shortcut", { act }); }
+    });
+  }
+  return { ok: true };
+});
+
+// 浏览器壳的「任务」按钮：回到主窗并切到本插件面板。
+ipcMain.on("browser:show-tasks", () => {
+  if (win && !win.isDestroyed()) {
+    win.show(); win.focus();
+    win.webContents.send("ui:switch-panel", "plugin.browser");
+  }
+});
 
 // 子窗口窗口控制：自绘标题栏按钮 → 最小化 / 最大化(切换) / 关闭
 ipcMain.on("win:ctrl", (e, act) => {
@@ -261,14 +411,45 @@ function setupTray() {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 900,
-    height: 560,
+    width: 1120,
+    height: 720,
+    minWidth: 900,
+    minHeight: 560,
     title: "OCTplugin · MVP",
     icon: APP_LOGO,
     frame: false, // 完全无边框：自绘顶部栏（拖拽区 + 窗口控制按钮），去掉原生重复的标题栏
-    webPreferences: { nodeIntegration: true, contextIsolation: false },
+    // webviewTag：浏览器面板用 <webview> 承载网页（被浏览页与宿主隔离，无 node / 无 preload）。
+    webPreferences: { nodeIntegration: true, contextIsolation: false, webviewTag: true },
   });
   win.loadFile("index.html");
+
+  // ── <webview> 加固 ──────────────────────────────────────────────────
+  // 宿主渲染进程本身开着 nodeIntegration，所以必须在主进程这一层把 guest 的能力收口：
+  // 丢掉 preload、强制关闭 node、强制 contextIsolation/webSecurity，并只放行 http(s)/about:blank。
+  // 少了这一步，任何能往宿主 DOM 注入 <webview> 的路径都能拿到 node 权限。
+  win.webContents.on("will-attach-webview", (e: any, webPreferences: any, params: any) => {
+    const src = String((params && params.src) || "");
+    if (!/^(https?:|about:blank)/i.test(src)) { e.preventDefault(); return; }
+    delete webPreferences.preload;
+    webPreferences.nodeIntegration = false;
+    webPreferences.nodeIntegrationInSubFrames = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.webSecurity = true;
+    webPreferences.allowRunningInsecureContent = false;
+  });
+
+  // 被浏览页的权限请求默认拒绝，只放行不涉及隐私的几项；
+  // 否则 3 个后台飞书页面都可能静默拿到通知/定位/摄像头。
+  try {
+    const browserSession = session.fromPartition("persist:oct-browser");
+    browserSession.setPermissionRequestHandler((_wc: any, permission: string, callback: any) => {
+      const allow = ["clipboard-sanitized-write", "fullscreen", "pointerLock", "keyboardLock"];
+      callback(allow.includes(permission));
+    });
+  } catch (err: any) {
+    console.warn("[browser] 权限处理器设置失败", (err && err.message) || err);
+  }
+
   // 生命周期契约：主窗销毁后立即把引用置空。所有访问点均以 `if (win)` 判活，
   // 避免关闭阶段异步回调（内核 WS 事件等）打到已销毁窗口抛 "Object has been destroyed"。
   win.on("closed", () => { win = null; });
@@ -297,7 +478,13 @@ function createWindow() {
 // manifest 里自己声明 auto_grant —— 那等于插件给自己发权限，perms.json 就形同虚设。
 // 名单内插件按其 manifest **声明的全部权限**放权（不越声明范围）；已授权则不重复写。
 // 想长期收回某个插件的权限，把它从这份名单里删掉再去设置页撤销。
-const FIRST_PARTY_PLUGINS = ["translate"]; // 一方插件自动放权名单（translate 声明 file/local_model/screen/mic）
+// 一方插件自动放权名单（按各自 manifest 声明的权限位放权）。
+// 注意：能力链路涉及的所有一方插件都必须在此列，否则会静默降级为「插件不可用/权限拒绝」：
+//   - capability-gateway 需 local_model（读自身设置）+ file_read/file_write（txt↔临时文件中转），
+//     缺 local_model 会导致它读不到 providerChain 等设置、退回内置默认（链首 hy-mt-server）→
+//     registry.call 报 E_PLUGIN_STATE（plugin invalid state）且不降级；
+//   - opus-mt-server / sherpa-onnx / rapidocr-onnx / moss-tts-onnx 为 provider，需 file_read/file_write 等。
+const FIRST_PARTY_PLUGINS = ["translate", "capability-gateway", "opus-mt-server", "sherpa-onnx", "rapidocr-onnx", "moss-tts-onnx"];
 
 async function autoGrantFirstParty() {
   for (const pid of FIRST_PARTY_PLUGINS) {
@@ -462,11 +649,11 @@ ipcMain.handle("res:set", async (e, { pid, item }: any = {}) => {
 
 // ── §27 文件关联（Windows「打开方式」） ─────────────────────────────
 // 宿主启动时向 HKCU\Software\Classes 静默注册「打开方式」项（无需管理员权限）：
-//   1) Applications\octplugin.exe → 出现在「打开方式 → 选择其他应用」；
+//   1) Applications\OctPlugins.exe → 出现在「打开方式 → 选择其他应用」；
 //   2) 每扩展名 OpenWithProgids → 直接出现在右键「打开方式」子菜单。
 // 用户右键文件 → 打开方式 → 本应用 → Windows 以「<exe> <file>」拉起 → 单实例转发
 // 文件路径给主实例 → 切 conversion 面板列出可达目标格式并允许直接转换（conversion.md §27）。
-const FA_APP = "octplugin.exe"; // Applications 子键名（与打包后 exe 文件名一致）
+const FA_APP = "OctPlugins.exe"; // Applications 子键名（与打包后 exe 文件名一致）
 const FA_PROGID = "OctPlugins.OpenWith"; // 打开方式 ProgID
 // 打开方式命令：打包后直接以应用 exe 打开；开发模式经 electron.exe + 入口脚本。
 function faEntryCommand() {
@@ -914,8 +1101,33 @@ function connect(auth: any): Promise<any> {
           const ov = p.source ? overlayRoute.get(p.source) : undefined;
           if (ov && !ov.isDestroyed()) {
             try { ov.webContents.send("overlay:event", JSON.stringify(msg)); } catch (e) {}
-          } else if (p.source) {
+          } else if (p.source && overlaySeen.has(p.source)) {
             console.log("[overlay:miss]", p.source, msg.method, "route=", !!overlayRoute.get(p.source));
+          }
+          // oimd 上行 → 宿主动作：托盘菜单「打开设置/设备同步/文本翻译」经 oim 插件
+          // 上行到宿主落地（宿主离线时 oimd 已弹气泡，此分支只在宿主在线时触发）。
+          if (p.source === "oim" && msg.params && msg.params.type) {
+            const t = msg.params.type;
+            const d = (msg.params.data && typeof msg.params.data === "object") ? msg.params.data : {};
+            if (t === "oim.open_panel" && d.panel) {
+              if (win && !win.isDestroyed()) { win.show(); win.webContents.send("ui:switch-panel", d.panel); }
+            } else if (t === "oim.open_translate") {
+              const url = translateTextWinUrl();
+              if (url) spawnPluginWindow(url, { title: "文本翻译", width: 520, height: 460, frameless: true });
+            }
+          }
+          // browser 插件：在真实浏览器里开标签 / 只开浏览器窗口。
+          if (msg.method === "event" && p.type === "browser.open" && p.data) {
+            openBrowserTab(p.data, { source: p.source }).catch((err) => {
+              console.error("[browser] 打开标签失败", (err && err.message) || err);
+            });
+          }
+          if (msg.method === "event" && p.type === "browser.shell") {
+            ensureBrowserWindow().catch(() => { /* ignore */ });
+          }
+          // 插件请求回收某个任务标签（browser.closeTab）。
+          if (msg.method === "event" && p.type === "browser.close-tab" && p.data) {
+            closeBrowserTab(p.data);
           }
           // 判活：主窗关闭后内核广播仍可能到达，直接 send 会抛 Object has been destroyed
           if (win && !win.isDestroyed()) win.webContents.send("kernel:event", JSON.stringify(msg));
@@ -950,6 +1162,191 @@ function rpc(method, params, timeoutMs = 15000): Promise<any> {
     };
     ws.on("message", onMsg);
   });
+}
+
+// ── 剪贴板同步引擎（sync 插件 · 宿主侧） ───────────────────────────
+// 常驻宿主主进程：剪贴板读写用 Electron clipboard（可靠），HTTP 用 Node20 全局 fetch。
+// 配置单一事实源 = sync 插件的 settingsSchema（plugin.getSettings），每轮服务器轮询前刷新；
+// 状态经 webContents.send("sync:status") → renderer → sync iframe(oct:sync:status)。
+// 剪贴板同步：本地变化 → PUT /clipboard；轮询 /clipboard/meta 比对 hash（=内容 sha256），
+// 不一致 → GET 全文写回剪贴板并同步 lastLocalText（防回环）。
+const syncState = {
+  enabled: false,
+  serverUrl: "",
+  token: "",
+  pollMs: 3000,
+  lastLocalText: "",
+  lastServerHash: "",
+  online: false,
+  lastSyncAt: 0,
+  lastErr: "",
+  busy: false,
+};
+
+async function syncLoadConfig() {
+  try {
+    const v = await rpc("plugin.getSettings", { pluginId: "sync" });
+    const s = (v && v.effective && v.effective.settings) || {};
+    syncState.enabled = !!s.enabled;
+    syncState.serverUrl = String(s.serverUrl || "").replace(/\/+$/, "");
+    syncState.token = String(s.token || "");
+    syncState.pollMs = Math.max(1000, parseInt(s.pollMs, 10) || 3000);
+  } catch (e) { /* 内核未连/插件未注册：保持上次配置 */ }
+}
+
+function syncReady() { return syncState.enabled && !!syncState.serverUrl; }
+
+// 带 token 头与 5s 超时的 fetch 封装。
+function syncFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 5000);
+  const headers = new Headers(init.headers || {});
+  if (syncState.token) headers.set("X-Sync-Token", syncState.token);
+  return fetch(url, Object.assign({}, init, { headers, signal: ctl.signal }))
+    .finally(() => clearTimeout(timer));
+}
+
+// 推状态给 sync 插件页（只含元信息，不含剪贴板明文）。
+function syncEmitStatus() {
+  try {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("sync:status", {
+        enabled: syncState.enabled,
+        serverUrl: syncState.serverUrl,
+        pollMs: syncState.pollMs,
+        online: syncState.online,
+        hash: syncState.lastServerHash,
+        lastSyncAt: syncState.lastSyncAt,
+        lastErr: syncState.lastErr,
+      });
+    }
+  } catch (e) { /* 窗口已销毁则忽略 */ }
+}
+
+// 定时器A：本机剪贴板轮询（400ms）——变化即主动上传。
+setInterval(async () => {
+  if (!syncReady() || !ws || ws.readyState !== 1) return;
+  let t = "";
+  try { t = clipboard.readText() || ""; } catch (e) { return; }
+  const changed = t !== syncState.lastLocalText;
+  syncState.lastLocalText = t; // 恒更新：首读仅播种，避免抖动
+  if (!changed || t === "") return; // 空内容不上传
+  try {
+    const r = await syncFetch(syncState.serverUrl + "/clipboard", {
+      method: "PUT", body: t,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+    if (r.status === 401) { syncState.lastErr = "鉴权失败（token 不符）"; syncEmitStatus(); return; }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const m = await r.json();
+    syncState.lastServerHash = m.hash; // 上传即记版本，避免 3s 后自下载
+    syncState.online = true; syncState.lastErr = ""; syncState.lastSyncAt = Date.now();
+    syncEmitStatus();
+  } catch (e: any) {
+    syncState.online = false; syncState.lastErr = String((e && e.message) || e);
+    syncEmitStatus();
+  }
+}, 400);
+
+// 定时器B：服务器轮询（1s 刻度，实际按 pollMs 节流）——hash 不一致则下载写回。
+let syncLastPoll = 0;
+setInterval(async () => {
+  if (!ws || ws.readyState !== 1) return;
+  if (Date.now() - syncLastPoll < syncState.pollMs) return;
+  syncLastPoll = Date.now();
+  await syncLoadConfig(); // 每轮刷新配置（enabled/serverUrl 变更 ≤1 个 pollMs 生效）
+  if (!syncReady() || syncState.busy) return;
+  syncState.busy = true;
+  try {
+    const metaRes = await syncFetch(syncState.serverUrl + "/clipboard/meta");
+    if (metaRes.status === 401) { syncState.lastErr = "鉴权失败（token 不符）"; syncEmitStatus(); return; }
+    if (metaRes.status === 404) { syncState.lastServerHash = ""; syncState.online = true; syncState.lastErr = ""; syncEmitStatus(); return; }
+    if (!metaRes.ok) throw new Error("HTTP " + metaRes.status);
+    const meta = await metaRes.json();
+    if (!meta.hash || meta.hash === syncState.lastServerHash) { syncState.online = true; syncEmitStatus(); return; }
+    const getRes = await syncFetch(syncState.serverUrl + "/clipboard");
+    if (!getRes.ok) throw new Error("HTTP " + getRes.status);
+    const content = await getRes.text();
+    syncState.lastServerHash = meta.hash;
+    let cur = "";
+    try { cur = clipboard.readText() || ""; } catch (e) { /* 读剪贴板失败按空处理 */ }
+    if (content !== cur) {
+      clipboard.writeText(content);
+      syncState.lastLocalText = content; // 防回环：本地轮询不再重传同一内容
+    }
+    syncState.online = true; syncState.lastErr = ""; syncState.lastSyncAt = Date.now();
+    syncEmitStatus();
+  } catch (e: any) {
+    syncState.online = false; syncState.lastErr = String((e && e.message) || e);
+    syncEmitStatus();
+  } finally {
+    syncState.busy = false;
+  }
+}, 1000);
+
+// 启动即播种本机剪贴板（避免把已有内容误当"新变化"上传）。
+try { syncState.lastLocalText = clipboard.readText() || ""; } catch (e) { /* 忽略 */ }
+
+// sync 插件页：保存设置后强制刷新配置并立即回显状态。
+ipcMain.handle("sync:cfg", async () => {
+  await syncLoadConfig();
+  return {
+    enabled: syncState.enabled, serverUrl: syncState.serverUrl, pollMs: syncState.pollMs,
+    online: syncState.online, hash: syncState.lastServerHash,
+    lastSyncAt: syncState.lastSyncAt, lastErr: syncState.lastErr,
+  };
+});
+
+// sync 插件页：文件传输（list / upload / download）——引擎在 main 进程完成 fetch + dialog + fs。
+ipcMain.handle("sync:files:op", async (_e, payload: any = {}) => {
+  const op = payload && payload.op;
+  const name = payload && payload.name;
+  if (!syncState.serverUrl) return { ok: false, error: "未配置服务器地址" };
+  try {
+    if (op === "list") {
+      const r = await syncFetch(syncState.serverUrl + "/files/");
+      if (r.status === 401) return { ok: false, error: "鉴权失败（token 不符）" };
+      if (!r.ok) return { ok: false, error: "HTTP " + r.status };
+      return { ok: true, files: await r.json() };
+    }
+    if (op === "upload") {
+      const pick = await dialog.showOpenDialog({ title: "选择要上传的文件", properties: ["openFile"] });
+      if (pick.canceled || !pick.filePaths.length) return { ok: false, canceled: true };
+      const fp = pick.filePaths[0];
+      const data = fs.readFileSync(fp);
+      const r = await syncFetch(syncState.serverUrl + "/files/" + encodeURIComponent(path.basename(fp)), {
+        method: "PUT", body: data,
+        headers: { "Content-Type": "application/octet-stream" },
+      });
+      if (r.status === 401) return { ok: false, error: "鉴权失败（token 不符）" };
+      if (!r.ok) return { ok: false, error: "HTTP " + r.status };
+      return { ok: true, ...(await r.json()) };
+    }
+    if (op === "download") {
+      if (!name) return { ok: false, error: "缺文件名" };
+      const save = await dialog.showSaveDialog({ title: "保存文件", defaultPath: name });
+      if (save.canceled || !save.filePath) return { ok: false, canceled: true };
+      const r = await syncFetch(syncState.serverUrl + "/files/" + encodeURIComponent(name));
+      if (r.status === 401) return { ok: false, error: "鉴权失败（token 不符）" };
+      if (!r.ok) return { ok: false, error: "HTTP " + r.status };
+      const buf = Buffer.from(await r.arrayBuffer());
+      fs.writeFileSync(save.filePath, buf);
+      return { ok: true, name, size: buf.length };
+    }
+    return { ok: false, error: "未知操作 " + op };
+  } catch (e: any) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+});
+
+// ── oimd 桥接动作 ─────────────────────────────────────────────
+// 工具条已迁入 oimd（WeaselServer fork 的托盘图标+右键菜单），宿主只收 oimd 上行
+// 事件（见 connect() 中 p.source === "oim" 分支）并落地为打开面板/翻译新窗。
+// 文本翻译新窗 URL（oim.open_translate 事件复用）。
+function translateTextWinUrl() {
+  if (!kernelAuth) return "";
+  return "http://127.0.0.1:" + kernelAuth.port + "/plugin/translate/ui/text_win.html" +
+    "?auth=" + encodeURIComponent(kernelAuth.token) + "&kport=" + kernelAuth.port;
 }
 
 // §27：单实例。Windows「打开方式」以新进程拉起 → 无锁则退出；有锁则转发文件路径。
@@ -1032,6 +1429,9 @@ app.on("will-quit", () => {
   overlayWindows.forEach((w) => { if (w && !w.isDestroyed()) w.destroy(); });
   overlayWindows.clear();
   overlayRoute.clear();
+  // 浏览器已内嵌主窗，无独立窗口需要回收；清掉未完成任务的超时定时器即可。
+  pendingTasks.forEach((t) => clearTimeout(t.timer));
+  pendingTasks.clear();
 });
 
 app.on("window-all-closed", () => {

@@ -16,6 +16,10 @@ const $$: (sel: string) => any = (sel) => document.querySelectorAll(sel);
 // 宿主设置页与各插件页引用同一份实现，此处仅作类型声明。
 declare const OctSelect: any;
 
+// 事件日志开关。内核事件（尤其 tool 高频事件）每次 console 都要序列化 payload，
+// 而宿主 UI、浏览器 chrome 与这些日志共用同一条主线程——排查时临时置 true，平时保持关闭。
+const DEBUG_EVENTS = false;
+
     // ── 设置子窗口模式：读取 ?view=settings&sec=…，只显示对应那张设置卡片 ──
     // 说明：index.html 不做 auth/kport 自连内核；渲染脚本始终走 ipcRenderer.invoke("rpc") 由宿主主进程
     // 复用内核连接。子窗口加载同一份 index.html，故这里仅需 URL 中的 view/sec 决定显示哪张表单。
@@ -174,6 +178,9 @@ declare const OctSelect: any;
             }
           };
           nav.insertBefore(btn, prev.nextSibling); prev = btn;
+          // browser：面板由 index.html 静态提供（内嵌浏览器需要 <webview>，而 webview 不能在 iframe 内创建），
+          // 这里只保留侧栏按钮，跳过后面的 iframe 面板创建。
+          if (pid === "browser") return;
           // 面板
           const sec = document.createElement("section");
           sec.className = "panel plugin-panel"; sec.id = "panel-plugin." + pid;
@@ -280,6 +287,16 @@ declare const OctSelect: any;
       // 通用剪贴板写入：插件 iframe 在取色期间非焦点文档，navigator.clipboard 会被静默拒绝，转主进程写。
       if (d.type === "oct.clipboard.write") {
         if (typeof d.text === "string") ipcRenderer.invoke("clipboard:write", { text: d.text });
+        return;
+      }
+      // sync 插件：文件传输操作（list/upload/download）→ 主进程同步引擎执行（fetch + dialog + fs）。
+      if (d.type === "oct.sync.files") {
+        if (ev.origin && KERNEL_BASE && !("" + ev.origin).includes("127.0.0.1")) return;
+        ipcRenderer.invoke("sync:files:op", { op: d.op, name: d.name })
+          .then((r: any) => {
+            try { ev.source.postMessage({ type: "oct:sync:files:result", reqId: d.reqId || 0, result: r || {} }, "*" as any); }
+            catch (e) { /* source 不可达则忽略 */ }
+          });
         return;
       }
       // 通用 overlay：请求宿主开/关某 kind:"overlay" 插件为其全屏透明鼠标穿透窗。
@@ -719,8 +736,13 @@ declare const OctSelect: any;
     }
     // 左侧标签切换（统一入口，仅切换 .active 显示即可）
     function showPanel(name) {
-      $$(".side-btn").forEach(b => b.classList.toggle("active", b.dataset.panel === name));
-      $$(".panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + name));
+      // 差异切换：classList.toggle(force) 在状态没变时也会写 class 属性，触发整窗口样式重算；
+      // 浏览器面板的 visibility/z-index 就挂在这个 class 上，每写一次都会让合成树重新分层。
+      const setActive = (el, on) => {
+        if (el.classList.contains("active") !== on) el.classList.toggle("active", on);
+      };
+      $$(".side-btn").forEach(b => setActive(b, b.dataset.panel === name));
+      $$(".panel").forEach(p => setActive(p, p.id === "panel-" + name));
       if (name.startsWith("plugin.")) ensurePluginFrame(name.slice("plugin.".length));
     }
     $$(".side-btn").forEach(btn => btn.onclick = () => showPanel(btn.dataset.panel));
@@ -1295,7 +1317,7 @@ declare const OctSelect: any;
       // 内核自产事件 method="event"；插件进程经 event.emit 上报的事件 method="event.emit"。两者都需处理。
       if (t.method !== "event" && t.method !== "event.emit") { console.log("event:", raw); return; }
       const p = t.params || {};
-      console.log(`[event] ${p.source}:${p.type}`, p.data);
+      if (DEBUG_EVENTS) console.log(`[event] ${p.source}:${p.type}`, p.data);
       // 内核进程状态事件：仅刷新圆点（颜色只信内核 State，不做乐观猜测）。
       if (p.source === "kernel" && p.type === "plugin.state" && p.data && p.data.id) {
         const b = document.querySelector(`nav.side .side-btn[data-plugin-id="${CSS.escape ? CSS.escape(p.data.id) : p.data.id}"]`);
@@ -1308,13 +1330,18 @@ declare const OctSelect: any;
         let inner = p.data;
         if (typeof inner === "string") { try { inner = JSON.parse(inner); } catch (e) { inner = null; } }
         const isCursor = !!(inner && inner.type === "cursor");
-        if (!isCursor) {
+        if (!isCursor && DEBUG_EVENTS) {
           console.warn(`[toolEvt] source=${p.source} type=${p.type} inner=${inner && inner.type} subs=${pids ? pids.size : 0}`);
         }
         if (pids && pids.size && !isCursor) {
           pids.forEach((pid) => forwardToPlugin(pid, { type: "oct:tool:event", source: p.source, dataType: p.type, data: p.data }));
         }
       }
+    });
+
+    // sync 插件：宿主同步引擎状态推送 → 转发 sync iframe（oct:sync:status）。
+    ipcRenderer.on("sync:status", (_e, st) => {
+      forwardToPlugin("sync", { type: "oct:sync:status", data: st || {} });
     });
 
     // ── 阶段L · 热键（快捷键）：动态扫描插件 manifest.json 的 hotkeys 声明 ──
@@ -1462,6 +1489,8 @@ declare const OctSelect: any;
     let FILTERED = [];
     let selIdx = 0;
     function switchPanel(name) { showPanel(name); }
+    // oim 常驻工具条 / 宿主主进程请求切面板（ui:switch-panel）。
+    ipcRenderer.on("ui:switch-panel", (_e, name) => { if (name) switchPanel(name); });
     function refreshPalette() {
       return rpc("command.list", {}).then(r => {
         PALETTE = SYS_CMDS.concat((r.commands || []).map(c => ({

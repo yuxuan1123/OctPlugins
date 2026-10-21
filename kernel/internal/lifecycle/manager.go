@@ -132,6 +132,9 @@ type Manager struct {
 	resources  *resources.Manager // §14 ResourceMap（extern deps 登记/获取/释放）
 	toolsRoot  string             // §14.2 tools/ 根（bundled 定位用）
 	modelsRoot string             // 转化域 §20.5：模型存储根（空 = DefaultModelsRoot）
+	// autoTools 由内核自动登记成 tool 资源的 provider 插件 id（providesModels 的 backend 落点），
+	// 仅这些条目在插件卸载时连带摘除；外部声明的同 id tool 不受影响。
+	autoTools map[string]struct{}
 
 	patrolOnce sync.Once // §12.2.3：健康巡检单 goroutine（全插件共享），once 防重复启动
 
@@ -1140,6 +1143,14 @@ func (m *Manager) healthSweep() {
 		if !p.Handshaken() && p.StartElapsed() > 5*time.Second {
 			log.Printf("[kernel] plugin %s handshake timeout (E_HANDSHAKE_TIMEOUT); terminating", r.id)
 			p.Kill()
+			continue
+		}
+		// 长任务豁免：有在途请求说明插件正在为调用方干活（典型如 provider 首次加载
+		// 本地模型：几十秒内没有任何协议输出是正常现象）。此时不得按心跳超时判死，
+		// 否则会把整条调用链（translate → capability-gateway → hy-mt-server）一起杀掉，
+		// 前端只会看到 E_PLUGIN_CRASHED。请求本身由 limits.request_timeout_ms /
+		// 调用方超时控制，超时后 pending 归零，再恢复心跳判活。
+		if p.PendingCount() > 0 {
 			continue
 		}
 		// 组装某插件的巡检快照与探针，喂 watchdog.Tick（心跳超时 / busy 僵死）。

@@ -1299,6 +1299,8 @@ func (s *Server) handleModelsRootGet(conn *websocket.Conn, req protocol.Request)
 	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
 		"root":       s.smanager.ModelsRootDir(),
 		"configured": configured,
+		"configPath": lifecycle.ModelsRootConfigRel,
+		"configFile": lifecycle.LoadModelsRootConfig(filepath.Dir(s.resourcesDir)),
 		"default":    lifecycle.DefaultModelsRoot,
 	}))
 }
@@ -1320,7 +1322,12 @@ func (s *Server) handleModelsRootSet(conn *websocket.Conn, req protocol.Request)
 		s.reply(conn, protocol.NewError(req.ID, protocol.ErrIO, map[string]any{"error": err.Error()}))
 		return
 	}
-	s.smanager.SetModelsRoot(p.Root)
+	// 空值 = 清除用户覆盖：回落 config/models-root.json，再回落内置默认。
+	effective := strings.TrimSpace(p.Root)
+	if effective == "" {
+		effective = lifecycle.LoadModelsRootConfig(filepath.Dir(s.resourcesDir))
+	}
+	s.smanager.SetModelsRoot(effective)
 	s.reply(conn, protocol.NewResult(req.ID, map[string]any{
 		"ok": true, "root": s.smanager.ModelsRootDir(),
 	}))

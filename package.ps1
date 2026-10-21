@@ -10,6 +10,7 @@
 #     *.dll *.pak locales\      Chromium/Electron runtime (from ui node_modules)
 #     resources\
 #       app\                    Electron app: package.json + index.html +
+#                               browser-panel.js + vendor\chrome-tabs +
 #                               build\*.js + node_modules\ws
 #       kernel\kerneld.exe      Go kernel daemon
 #       plugins\<id>\           plugin folders copied from plugins\
@@ -17,7 +18,8 @@
 #       sdk\                    oct_sdk (injected into python plugins via
 #                               PYTHONPATH=<root>/sdk/python, node via _resolve)
 #       config\                 user-settings.json (plugin prefs, e.g. the
-#                               capability-gateway provider chains)
+#                               capability-gateway provider chains) +
+#                               models-root.json (模型存储根, 默认 D:\AI_Model)
 #       state\perms.json        first-party permission grants (seeded)
 #       state\plugins\proxy\    mihomo GeoIP data (geoip.metadb), seeded from the
 #                               dev tree - see note below
@@ -33,18 +35,17 @@
 # Runtime-root logic: build\main.js computes __dirname\..\.. = resources\ ;
 # the kernel derives its root from kerneld.exe\.. = resources\ as well.
 #
-# Python env policy (why slim ships exactly one venv):
-#   Default ("essential"): ship only hy-mt-server's venv. Its dependency
-#   llama-cpp-python publishes ONLY an sdist on PyPI (no Windows wheel), so a
-#   first-run `uv pip install` would have to compile it with MSVC/CMake - not
-#   something an end user can be expected to have. The other four python
-#   plugins (opus-mt-server, doc-convert, sherpa-onnx, moss-tts-onnx) have
-#   prebuilt wheels for every dependency, so the kernel installs them on
-#   demand at first call (network required) - see kernel
-#   lifecycle/GetOrStart -> deps install gating (E_DEPS_MISSING +
-#   installing=true while it runs, then the plugin starts itself).
-#   -AllPyEnv: ship every venv (offline-ready, ~1.1 GB extra, old behavior)
-#   -NoPyEnv : ship no venv at all (leanest; needs network for most plugins)
+# Python env policy (offline first):
+#   Default: ship every python plugin whose venv already exists in the source
+#   tree (.\runtime, or <ResourcesSrc>\runtime). Everything is copied locally -
+#   no interpreter download, no pip install. The kernel resolves it from
+#   <root>\runtime\<id>\venv (see kernel/internal/runtime.VenvPython), and
+#   pyvenv.cfg `home` is rewritten to the bundled interpreter so the package
+#   works on a machine that never had uv/a CPython install.
+#   -AllPyEnv: force-ship every python plugin env (fails if a venv is missing
+#              and no uv is available to build it)
+#   -NoPyEnv : ship no venv at all (developer mode only: the kernel installer is
+#              still a skeleton, so python plugins would have no interpreter)
 #
 # Why sdk/config/state must ship:
 #   - sdk\    : python plugins do `import oct_sdk`; without it they die at
@@ -57,16 +58,21 @@
 #               E_PLUGIN_MISSING. Seeding perms.json pre-authorizes it.
 #
 # Usage:
-#   .\package.ps1                         build into default output dir (slim)
+#   .\package.ps1                                   build into .\dist (slim)
 #   .\package.ps1 -OutDir E:\Other\Dir
+#   .\package.ps1 -OutDir D:\pyex\OctPlugins -ResourcesSrc D:\oct_src -AllPyEnv
 #   .\package.ps1 -SkipUI                 skip tsc (reuse ui\build as-is)
+#   .\package.ps1 -ResourcesSrc <dir>     reuse plugins/runtime/config/state/bin from a
+#                                         previously packaged resources dir: everything is
+#                                         copied locally, nothing is downloaded
 #   .\package.ps1 -ForcePyReinstall       rebuild python venvs with uv
 #                                         instead of reusing .\runtime
 #   .\package.ps1 -AllPyEnv               ship every python venv (offline)
 #   .\package.ps1 -NoPyEnv                ship no python venv at all
 # ===========================================================================
 param(
-    [string]$OutDir = "D:\Project\HalfProject\OctPlugins",
+    [string]$OutDir = "",
+    [string]$ResourcesSrc = "",
     [switch]$SkipUI,
     [switch]$ForcePyReinstall,
     [switch]$AllPyEnv,
@@ -77,14 +83,30 @@ $ErrorActionPreference = "Stop"
 $root         = Split-Path -Parent $MyInvocation.MyCommand.Path
 $uiDir        = Join-Path $root "ui"
 $electronDist = Join-Path $uiDir "node_modules\electron\dist"
-$pluginSrc    = Join-Path $root "plugins"
 $sharedResSrc = Join-Path $root "resources"
 $sdkSrc       = Join-Path $root "sdk"
-$cfgSrc       = Join-Path $root "config\user-settings.json"
-$permsSrc     = Join-Path $root "state\perms.json"
-$devRuntime   = Join-Path $root "runtime"
 $kernelExe    = Join-Path $root "kernel\kerneld.exe"
 $csc          = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+
+# 素材来源：
+#   - plugins / runtime / bin：默认取仓库；-ResourcesSrc 指向一个已打包好的 resources
+#     目录时，改为从该目录本地复制（离线、不重建任何环境）。
+#   - config / state：永远取仓库（用户态配置与授权）。绝不能来自旧包——旧包的
+#     user-settings 可能把 provider 链指向本机不可用的引擎（例如 CPU 跑不动的 hy-mt），
+#     表现为"开发态能翻译、打包后崩溃/超时"。
+$srcRes           = if ($ResourcesSrc) { [System.IO.Path]::GetFullPath($ResourcesSrc).TrimEnd('\') } else { "" }
+$pluginSrc        = if ($srcRes) { Join-Path $srcRes "plugins" } else { Join-Path $root "plugins" }
+$devRuntime       = if ($srcRes) { Join-Path $srcRes "runtime" } else { Join-Path $root "runtime" }
+$binSrc           = if ($srcRes) { Join-Path $srcRes "bin" } else { Join-Path $root "bin" }
+$cfgSrc           = Join-Path $root "config\user-settings.json"
+$modelsRootCfgSrc = Join-Path $root "config\models-root.json"
+$permsSrc         = Join-Path $root "state\perms.json"
+$overridesSrc     = Join-Path $root "state\overrides.json"
+$geoSrc           = Join-Path $root "state\plugins\proxy"
+if (-not (Test-Path $geoSrc) -and $srcRes) { $geoSrc = Join-Path $srcRes "state\plugins\proxy" }
+if (-not (Test-Path $geoSrc)) { $geoSrc = Join-Path $root "state\plugins\proxy" }
+
+if (-not $OutDir) { $OutDir = Join-Path $root "dist" }
 
 function Die($msg) { Write-Host "[FAIL] $msg" -ForegroundColor Red; exit 1 }
 function Step($n, $msg) { Write-Host ""; Write-Host "=== [$n] $msg ===" -ForegroundColor Cyan }
@@ -109,6 +131,20 @@ function Capture-Quiet([string]$exe, [string[]]$argv) {
 function Read-Manifest($dir) {
     Get-Content (Join-Path $dir "manifest.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 }
+# 目录删除统一走 .NET：某些环境把 Remove-Item 接管为"移到回收站"（safe-delete），
+# 大目录/只读文件会在这步失败。这里直接物理删除，失败才报错。
+function Remove-Tree([string]$path) {
+    if (-not (Test-Path $path)) { return }
+    try { [System.IO.Directory]::Delete($path, $true) }
+    catch { Die ("cannot remove directory: " + $path + " -> " + $_.Exception.Message) }
+}
+
+# Step 3 会整目录删除 OutDir —— 禁止指向仓库根或它的父目录（防误删源码）。
+$rootFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\')
+$outFull  = [System.IO.Path]::GetFullPath($OutDir).TrimEnd('\')
+if ($outFull -eq $rootFull -or $rootFull.StartsWith($outFull + '\')) {
+    Die "OutDir 不能是项目根或它的父目录：$OutDir"
+}
 
 # ---------------------------------------------------------------------------
 Step "1/8" "Preflight checks"
@@ -117,8 +153,13 @@ if (-not (Test-Path (Join-Path $electronDist "electron.exe"))) {
 }
 if (-not (Test-Path $kernelExe)) { Die "kernel\kerneld.exe missing" }
 if (-not (Test-Path $csc))        { Die "csc.exe (.NET Framework) missing: $csc" }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "node not found in PATH" }
-if (-not $SkipUI -and -not (Get-Command npm -ErrorAction SilentlyContinue)) { Die "npm not found in PATH" }
+# node/npm 只在需要重新编译 TS 时必需（-SkipUI 复用 ui\build 时不需要）。
+$nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+$nodeExe = if ($nodeCmd) { $nodeCmd.Source } else { "" }
+if (-not $SkipUI) {
+    if (-not $nodeCmd) { Die "node not found in PATH (init fnm first, or pass -SkipUI)" }
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Die "npm not found in PATH (init fnm first, or pass -SkipUI)" }
+}
 if (-not (Test-Path (Join-Path $sdkSrc "python\oct_sdk\__init__.py"))) {
     Die "sdk\python\oct_sdk\__init__.py missing - python plugins would fail to import oct_sdk"
 }
@@ -135,8 +176,9 @@ foreach ($p in $pluginDirs) {
 
 $uvCmd = Get-Command uv.exe -ErrorAction SilentlyContinue
 $uvExe = if ($uvCmd) { $uvCmd.Source } else { "" }
-if (-not $uvExe -and -not $AllPyEnv) {
-    Die "uv.exe not found in PATH: slim packaging needs it to bundle the CPython interpreter, and the kernel needs resources\bin\uv.exe to install plugin dependencies on first run"
+if (-not $uvExe -and (Test-Path (Join-Path $binSrc "uv.exe"))) { $uvExe = Join-Path $binSrc "uv.exe" }
+if (-not $uvExe) {
+    Warn "uv.exe not found: only pre-built venvs / bundled interpreter can be shipped (nothing will be created)"
 }
 
 if (Get-Process OctPluginsHost -ErrorAction SilentlyContinue) {
@@ -149,8 +191,9 @@ if (Test-Path $OutDir) {
         catch { Die "target file is locked (app running?): $locked" }
     }
 }
-Write-Host "node    : $(node -v)"
+Write-Host "node    : $(if ($nodeExe) { & $nodeExe -v } else { '<not found>' })"
 Write-Host "uv      : $(if ($uvExe) { $uvExe } else { '<not found>' })"
+Write-Host "src     : $srcBase"
 Write-Host "plugins : $($pluginDirs.Count)"
 Write-Host "out     : $OutDir"
 
@@ -159,7 +202,11 @@ if (-not $SkipUI) {
     Step "2/8" "Compile host UI (npm run build / tsc)"
     Push-Location $uiDir
     try {
-        npm run build
+        # npm 会把镜像源等告警写到 stderr，PS 5.1 在 $ErrorActionPreference='Stop'
+        # 下会把原生命令的 stderr 变成终止错误 —— 故临时改为 Continue 并只看退出码。
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try { npm run build 2>&1 | Out-String | Write-Host } finally { $ErrorActionPreference = $prevEap }
         Assert-Native "tsc"
     } finally { Pop-Location }
     if (-not (Test-Path (Join-Path $uiDir "build\main.js"))) { Die "ui\build\main.js missing after tsc" }
@@ -169,13 +216,13 @@ if (-not $SkipUI) {
 
 # ---------------------------------------------------------------------------
 Step "3/8" "Prepare clean output folder + mirror Electron runtime"
-if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
+Remove-Tree $OutDir
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 Copy-Item (Join-Path $electronDist "*") -Destination $OutDir -Recurse -Force
 Move-Item (Join-Path $OutDir "electron.exe") (Join-Path $OutDir "OctPluginsHost.exe")
 $defaultApp = Join-Path $OutDir "resources\default_app.asar"
-if (Test-Path $defaultApp) { Remove-Item $defaultApp -Force }
+if (Test-Path $defaultApp) { try { [System.IO.File]::Delete($defaultApp) } catch { } }
 
 # ---------------------------------------------------------------------------
 Step "4/8" "Assemble resources\app (Electron application)"
@@ -194,6 +241,14 @@ Set-Content -Path (Join-Path $appDir "package.json") -Value $appPkg -Encoding AS
 $indexHtml = Join-Path $uiDir "index.html"
 if (-not (Test-Path $indexHtml)) { Die "ui\index.html missing" }
 Copy-Item $indexHtml (Join-Path $appDir "index.html")
+# 内嵌浏览器面板：index.html 直接用 <script src="browser-panel.js"> 管理 <webview>，
+# 加上 chrome-tabs 前端资源，二者都必须随包分发，否则打包后静态请求 404（面板/标签栏全废）。
+$panelJs = Join-Path $uiDir "browser-panel.js"
+if (-not (Test-Path $panelJs)) { Die "ui\browser-panel.js missing" }
+Copy-Item $panelJs (Join-Path $appDir "browser-panel.js") -Force
+$vendorDir = Join-Path $uiDir "vendor"
+if (-not (Test-Path $vendorDir)) { Die "ui\vendor missing (chrome-tabs)" }
+Copy-Item $vendorDir (Join-Path $appDir "vendor") -Recurse -Force
 Copy-Item (Join-Path $uiDir "build") (Join-Path $appDir "build") -Recurse -Force
 
 # ws is the single runtime npm dependency (zero transitive deps).
@@ -215,7 +270,7 @@ foreach ($p in $pluginDirs) {
     Copy-Item $p.FullName $dst -Recurse -Force
     # runtime caches must not ship inside the package
     foreach ($cache in @(Get-ChildItem $dst -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue)) {
-        Remove-Item $cache.FullName -Recurse -Force
+        Remove-Tree $cache.FullName
     }
 }
 
@@ -225,12 +280,22 @@ if (Test-Path $sharedResSrc) {
     Copy-Item (Join-Path $sharedResSrc "*") -Destination $sharedDst -Recurse -Force
 }
 
+$binDst = Join-Path $resRoot "bin"
 if ($uvExe) {
-    New-Item -ItemType Directory -Path (Join-Path $resRoot "bin") -Force | Out-Null
-    Copy-Item $uvExe (Join-Path $resRoot "bin\uv.exe") -Force
+    New-Item -ItemType Directory -Path $binDst -Force | Out-Null
+    Copy-Item $uvExe (Join-Path $binDst "uv.exe") -Force
     Ok "bin\uv.exe bundled from $uvExe"
 } else {
-    Warn "uv.exe not found in PATH - python envs can only be reused, not built"
+    Warn "uv.exe not found - python envs can only be reused, not built"
+}
+# node: Node 类型插件的解释器。打包后目标机未必装 node，故把本机 node.exe 一并分发
+# （内核 NodeInterp 优先用 <root>\bin\node.exe，其次才是 PATH）。
+if ($nodeExe -and ([System.IO.Path]::GetFileName($nodeExe) -ieq "node.exe")) {
+    New-Item -ItemType Directory -Path $binDst -Force | Out-Null
+    Copy-Item $nodeExe (Join-Path $binDst "node.exe") -Force
+    Ok "bin\node.exe bundled from $nodeExe"
+} else {
+    Warn "node.exe not found (or not a real exe) - Node plugins will need node in PATH"
 }
 
 # ---------------------------------------------------------------------------
@@ -240,18 +305,44 @@ $sdkDst = Join-Path $resRoot "sdk"
 New-Item -ItemType Directory -Path $sdkDst -Force | Out-Null
 Copy-Item (Join-Path $sdkSrc "*") -Destination $sdkDst -Recurse -Force
 foreach ($c in @(Get-ChildItem $sdkDst -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue)) {
-    Remove-Item $c.FullName -Recurse -Force
+    Remove-Tree $c.FullName
 }
 Ok "sdk -> resources\sdk (oct_sdk.py python + node)"
 
 # 2) config: host-side plugin preferences (capability-gateway provider chains).
+$cfgDst = Join-Path $resRoot "config"
+New-Item -ItemType Directory -Path $cfgDst -Force | Out-Null
 if (Test-Path $cfgSrc) {
-    $cfgDst = Join-Path $resRoot "config"
-    New-Item -ItemType Directory -Path $cfgDst -Force | Out-Null
     Copy-Item $cfgSrc (Join-Path $cfgDst "user-settings.json") -Force
     Ok "config -> resources\config\user-settings.json"
 } else {
-    Warn "config\user-settings.json not found - capability-gateway will have no provider chain"
+    # 缺失也要落一个可用文件：能力网关的 provider 链、UI 默认页都从它读。
+    $minimalCfg = @'
+{
+  "schemaVersion": 1,
+  "plugins": {}
+}
+'@
+    [System.IO.File]::WriteAllText((Join-Path $cfgDst "user-settings.json"), $minimalCfg,
+        (New-Object System.Text.UTF8Encoding($false)))
+    Warn "config\user-settings.json not found - wrote a minimal default"
+}
+
+# 2b) config/models-root.json：模型存储根（用户自行改盘符/目录，默认 D:\AI_Model）。
+#     内核优先级：user-settings.json.modelsRoot > 本文件 root > 内置 DefaultModelsRoot。
+$modelsRootDst = Join-Path $cfgDst "models-root.json"
+if (Test-Path $modelsRootCfgSrc) {
+    Copy-Item $modelsRootCfgSrc $modelsRootDst -Force
+    Ok "config -> resources\config\models-root.json (reused user value)"
+} else {
+    $modelsRootDefault = @'
+{
+  "root": "D:\\AI_Model"
+}
+'@
+    [System.IO.File]::WriteAllText($modelsRootDst, $modelsRootDefault,
+        (New-Object System.Text.UTF8Encoding($false)))
+    Ok "config -> resources\config\models-root.json (default D:\AI_Model)"
 }
 
 # 3) state/perms.json: seed the permission grants that the host does NOT
@@ -294,6 +385,13 @@ if ($seed.Count -gt 0) {
     Warn "no permission grant could be seeded"
 }
 
+# 3b) state/overrides.json: 用户态生命周期覆盖（load_mode / 心跳 / 请求超时等）。
+#     开发态能跑通的策略若写在这里，必须随包带走，否则打包后行为会悄悄变化。
+if (Test-Path $overridesSrc) {
+    Copy-Item $overridesSrc (Join-Path $stateDst "overrides.json") -Force
+    Ok "state -> resources\state\overrides.json"
+}
+
 # 4) state/plugins/proxy: mihomo's GeoIP data (MMDB) is NOT optional. proxy.exe
 #    runs the core with -d <OCT_PLUGIN_DATA> (= state\plugins\proxy) and mihomo
 #    downloads geoip.metadb from GitHub into that dir on first start. In networks
@@ -305,7 +403,6 @@ if ($seed.Count -gt 0) {
 #    which is the only reason the dev build "just works". Ship it as a seed so the
 #    packaged app needs no network for the default profile.
 $geoFiles = @("geoip.metadb", "Country.mmdb", "geoip.dat", "geosite.dat")
-$geoSrc   = Join-Path $root "state\plugins\proxy"
 $geoDst   = Join-Path $stateDst "plugins\proxy"
 $geoCopied = @()
 if (Test-Path $geoSrc) {
@@ -343,10 +440,13 @@ if ($NoPyEnv) {
 } elseif ($AllPyEnv) {
     $shipEnv = $pyIds
 } else {
-    $shipEnv = @($pyIds | Where-Object { $essentialEnv -contains $_ })
-    $lazyEnv = @($pyIds | Where-Object { $shipEnv -notcontains $_ })
-    Warn ("slim mode: shipping " + $(if ($shipEnv.Count) { $shipEnv -join ", " } else { "<none>" }) +
-          "; installed on 1st call: " + $(if ($lazyEnv.Count) { $lazyEnv -join ", " } else { "<none>" }))
+    # 默认（离线优先）：把来源目录里"已有可复用 venv"的 python 插件全部随包分发；
+    # 只有拿不到现成环境的插件才需要首启联网安装。原 slim 策略仍可用 -NoPyEnv 收窄。
+    $reusable = @($pyIds | Where-Object { Test-Path (Join-Path $devRuntime ($_ + "\venv\Scripts\python.exe")) })
+    $shipEnv  = @($reusable)
+    $lazyEnv  = @($pyIds | Where-Object { $shipEnv -notcontains $_ })
+    Warn ("shipping " + $(if ($shipEnv.Count) { $shipEnv -join ", " } else { "<none>" }) +
+          "; no local env (would install on 1st call): " + $(if ($lazyEnv.Count) { $lazyEnv -join ", " } else { "<none>" }))
 }
 
 # Bundle the uv-managed CPython 3.12 interpreter itself. Two reasons:
@@ -357,12 +457,19 @@ if ($NoPyEnv) {
 $bundledPyDir = $null
 if (-not $NoPyEnv) {
     $srcPy = ""
-    if ($uvExe) {
+    # 1) 优先复用来源目录里已有的随包解释器（<src>\runtime\python\<impl>\python.exe）：
+    #    纯本地复制，不联网、不下载。
+    foreach ($d in @(Get-ChildItem (Join-Path $devRuntime "python") -Directory -ErrorAction SilentlyContinue)) {
+        $cand = Join-Path $d.FullName "python.exe"
+        if (Test-Path $cand) { $srcPy = $cand; break }
+    }
+    # 2) 其次用本机已有的 uv 托管 3.12（仍是本地文件）
+    if (-not $srcPy -and $uvExe) {
         $found = @(Capture-Quiet $uvExe @("python", "find", "3.12") | Where-Object { $_ -match 'python\.exe\s*$' })
         if ($LASTEXITCODE -eq 0 -and $found.Count -gt 0) { $srcPy = $found[0].ToString().Trim() }
     }
     if (-not $srcPy -or -not (Test-Path $srcPy)) {
-        Die "cannot locate a uv-managed CPython 3.12 to bundle (uv python find 3.12 failed)"
+        Die "cannot locate a CPython 3.12 to bundle (no $devRuntime\python, and 'uv python find 3.12' failed)"
     }
     $srcPyRoot = Split-Path -Parent $srcPy
     $pyName    = Split-Path -Leaf $srcPyRoot
@@ -380,11 +487,18 @@ if (-not $NoPyEnv) {
     # its base interpreter some other way and silently ignores `home` - so the
     # launcher is swapped in below (otherwise the shipped venv stays bound to
     # this machine's %APPDATA%\uv\python and dies on any other machine).
-    $scratch    = Join-Path $env:TEMP ("octpkg_venv_" + $PID)
-    if (Test-Path $scratch) { Remove-Item $scratch -Recurse -Force }
-    Run-Quiet $uvExe @("venv", "--python", $pyExePath, $scratch)
-    Assert-Native "uv venv (launcher scratch)"
-    $launcherDir = Join-Path $scratch "Scripts"
+    # 无 uv 时不替换启动器：来源 venv 若是 uv/venv 正常创建的，其 Scripts\python.exe
+    # 已经是遵循 pyvenv.cfg `home` 的 venv launcher，改写 home 后即可用。
+    $launcherDir = $null
+    if ($uvExe) {
+        $scratch = Join-Path $env:TEMP ("octpkg_venv_" + $PID)
+        Remove-Tree $scratch
+        Run-Quiet $uvExe @("venv", "--python", $pyExePath, $scratch)
+        Assert-Native "uv venv (launcher scratch)"
+        $launcherDir = Join-Path $scratch "Scripts"
+    } else {
+        Warn "uv not available - keeping the original venv launchers (pyvenv.cfg home is still rewritten)"
+    }
 }
 
 foreach ($id in $shipEnv) {
@@ -399,7 +513,7 @@ foreach ($id in $shipEnv) {
         New-Item -ItemType Directory -Path $dstVenv -Force | Out-Null
         Run-Quiet "robocopy" @($devVenv, $dstVenv, "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/XD", "__pycache__")
         if ($LASTEXITCODE -ge 8) { Die "robocopy $id venv failed (exit $LASTEXITCODE)" }
-        Ok ("{0,-16} reused from .\runtime" -f $id)
+        Ok ("{0,-16} reused from {1}" -f $id, $devVenv)
     } elseif (Test-Path $req) {
         if (-not $uvExe) { Die "uv is required to build the $id env (not in PATH)" }
         New-Item -ItemType Directory -Path $dstVenv -Force | Out-Null
@@ -445,12 +559,12 @@ foreach ($id in $shipEnv) {
     Write-Host ("       " + $id + " site-packages dist-info = " + $distInfo.Count)
 }
 if ($pyIds.Count -eq 0) { Warn "no python plugins found" }
-if ($scratch -and (Test-Path $scratch)) { Remove-Item $scratch -Recurse -Force }
+if ($scratch) { Remove-Tree $scratch }
 
 # ---------------------------------------------------------------------------
 Step "8/8" "Build admin launcher (OctPlugins.exe) with embedded UAC manifest"
 $tmpDir = Join-Path $env:TEMP ("octpkg_" + $PID)
-if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
+Remove-Tree $tmpDir
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 $launcherCs = @'
@@ -521,7 +635,7 @@ $launcherExe = Join-Path $OutDir "OctPlugins.exe"
     /win32manifest:$(Join-Path $tmpDir "app.manifest") `
     /out:$launcherExe (Join-Path $tmpDir "launcher.cs")
 Assert-Native "csc launcher"
-Remove-Item $tmpDir -Recurse -Force
+Remove-Tree $tmpDir
 
 # ---------------------------------------------------------------------------
 Write-Host ""
@@ -531,11 +645,15 @@ $mustExist = @(
     "OctPluginsHost.exe",
     "resources\app\package.json",
     "resources\app\index.html",
+    "resources\app\browser-panel.js",
+    "resources\app\vendor\chrome-tabs\chrome-tabs.js",
     "resources\app\build\main.js",
+    "resources\app\build\renderer.js",
     "resources\app\node_modules\ws\package.json",
     "resources\kernel\kerneld.exe",
     "resources\sdk\python\oct_sdk\__init__.py",
     "resources\config\user-settings.json",
+    "resources\config\models-root.json",
     "resources\state\perms.json",
     "resources\resources\theme\plugin.css"
 )

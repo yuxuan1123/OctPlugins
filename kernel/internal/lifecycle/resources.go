@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 
@@ -68,6 +69,9 @@ func (m *Manager) registerProvidedModels(mf Manifest) {
 	if rs == nil || len(mf.ProvidesModels) == 0 {
 		return
 	}
+	// backend 指向提供者插件 id，故先把该插件自身登记成 ResourceMap 的 tool 条目，
+	// 否则模型 Acquire 时 Acquire(backend) 会查表落空（resource "…" not registered）。
+	m.registerProviderTool(mf.ID)
 	for _, pm := range mf.ProvidesModels {
 		id := pm.ID
 		if id == "" {
@@ -110,6 +114,42 @@ func (m *Manager) registerProvidedModels(mf Manifest) {
 	}
 }
 
+// registerProviderTool 把「提供模型的插件」自身登记成 tool 资源（模型 backend 的落点）。
+//
+// 模型条目的 backend 是提供它的插件 id（见 registerProvidedModels 的 mf.ID），资源层要求
+// Acquire(backend) 能查表命中，否则每次模型 Acquire 都会打一条
+// `backend … acquire degraded: resource "…" not registered`。这里补一条 tool 条目：
+//   - start：GetOrStart(插件) —— 与 registry.call 的懒启动同一条路径，模型就绪前先保证 provider 在线；
+//   - stop：空操作 —— 插件生命周期归 lifecycle（recycle / StopPlugin / 退出清理），资源层不擅自停进程。
+//
+// 已存在同 id 条目（例如某插件用 externalDependencies 声明过它）则复用，不覆盖其定位方案。
+func (m *Manager) registerProviderTool(providerID string) {
+	rm := m.resourceManager()
+	if rm == nil || providerID == "" {
+		return
+	}
+	if rm.Get(providerID) != nil {
+		return
+	}
+	tool := resources.NewPluginTool(providerID, func(context.Context) error {
+		pl, err := m.GetOrStart(providerID)
+		if err != nil {
+			return fmt.Errorf("provider plugin %s: %w", providerID, err)
+		}
+		if !pl.Alive() {
+			return fmt.Errorf("provider plugin %s is down", providerID)
+		}
+		return nil
+	}, nil)
+	rm.Register(tool)
+	m.mu.Lock()
+	if m.autoTools == nil {
+		m.autoTools = map[string]struct{}{}
+	}
+	m.autoTools[providerID] = struct{}{}
+	m.mu.Unlock()
+}
+
 // unregisterProvidedModels 卸载 tool 时收回其模型声明（registry.json.models + ResourceMap）。
 func (m *Manager) unregisterProvidedModels(id string) {
 	m.mu.Lock()
@@ -128,6 +168,16 @@ func (m *Manager) unregisterProvidedModels(id string) {
 		})
 		for _, mid := range doomed {
 			rm.Unregister(mid)
+		}
+	}
+	// 收回本层自动登记的 provider tool 条目（外部声明的同 id tool 不在此列）。
+	if rm != nil {
+		m.mu.Lock()
+		_, auto := m.autoTools[id]
+		delete(m.autoTools, id)
+		m.mu.Unlock()
+		if auto {
+			rm.Unregister(id)
 		}
 	}
 	if rs == nil {

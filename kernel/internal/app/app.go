@@ -139,10 +139,18 @@ func Run(root string) error {
 		f.Plugins[pluginID] = pc
 		return settingsStore.Save(f)
 	})
-	// 转化域 §20.5：模型存储根由用户决定（user-settings.json 的 models.root），空则用内置默认。
+	// 转化域 §20.5：模型存储根覆盖顺序（高 → 低）：
+	//   user-settings.json 的 modelsRoot（宿主设置页写入）
+	//     > config/models-root.json 的 root（随包分发的用户可编辑配置）
+	//       > lifecycle.DefaultModelsRoot（D:\AI_Model）
+	modelsRoot := lifecycle.LoadModelsRootConfig(root)
 	if f, err := settingsStore.Load(); err == nil {
-		manager.SetModelsRoot(f.ModelsRoot())
+		if v := f.ModelsRoot(); v != "" {
+			modelsRoot = v
+		}
 	}
+	manager.SetModelsRoot(modelsRoot)
+	log.Printf("[kernel] models root: %s", manager.ModelsRootDir())
 	// §17.3：内核独占写 state/。宿主一律经 RPC（plugin.resources/hotkeys.*）读写，不得直连文件。
 	srv.SetStateDir(storeDir)
 

@@ -51,6 +51,36 @@ func NewTool(id, method, declaredPath, toolsRoot string) *Entry {
 	return e
 }
 
+// NewPluginTool 构造「由插件进程承载的工具」登记录目（provider 型 tool）。
+//
+// 与 NewTool 的区别：provider 型 tool 没有独立的可执行文件可定位（它自己就是一个插件），
+// 「启动」= 由宿主生命周期把插件进程带起来，「停止」= 归还引用、不擅自杀插件进程
+// （插件生命周期归 lifecycle 管）。因此这里由调用方注入 start/stop。
+//
+// 用途：providesModels 的模型条目 backend 指向提供它的插件 id（见 lifecycle.registerProvidedModels），
+// 模型 Acquire 前要先 Acquire backend；若 backend 从未登记，会退化成
+// `resource "<id>" not registered` 的降级日志（§14.5 查表复用落空）。
+func NewPluginTool(id string, start func(context.Context) error, stop func() error) *Entry {
+	e := &Entry{
+		ID:    id,
+		Kind:  KindTool,
+		State: "registered",
+	}
+	e.spawn = func(ctx context.Context) error {
+		if start == nil {
+			return nil
+		}
+		return start(ctx)
+	}
+	e.stop = func() error {
+		if stop != nil {
+			return stop()
+		}
+		return nil
+	}
+	return e
+}
+
 // LocateResult 定位结果。
 type LocateResult struct {
 	Path  string

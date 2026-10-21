@@ -52,6 +52,12 @@ kernel/internal/deps/
 state/
 config/
 runtime/
+# 例外（重要）：上面的 `config/`、`runtime/` 是不带斜杠前缀的通配规则，会连带把
+# 内核里的同名 **Go 包**一起忽略 —— kernel/internal/config 与 kernel/internal/runtime
+# 曾经因此从未入库，导致换机/克隆后内核编译失败（undefined: config.SchemaProps 等）。
+# 这里显式放行这两个包目录（否定规则须写在忽略规则之后）。
+!kernel/internal/config/
+!kernel/internal/runtime/
 # 插件配置目录：含 CHECKIN_TOKEN 等凭据，禁止入库
 store/
 *.tmp

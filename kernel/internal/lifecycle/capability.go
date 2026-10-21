@@ -1,6 +1,8 @@
 package lifecycle
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -25,8 +27,34 @@ import (
 // 故 MUST 置顶。
 
 // DefaultModelsRoot 模型存储的内置默认根（转化域 §20.5）。
-// 用户可在 user-settings.json 的 models.root 覆盖。
+// 覆盖顺序（后者优先）：本常量 → config/models-root.json 的 root → user-settings.json 的 modelsRoot。
 const DefaultModelsRoot = `D:\AI_Model`
+
+// ModelsRootConfigRel 模型存储根的用户配置文件（相对项目根 = kerneld.exe 所在目录的上一级）。
+// 随包分发的默认内容为 {"root": "D:\\AI_Model"}，用户可直接编辑它换盘符/目录。
+const ModelsRootConfigRel = "config/models-root.json"
+
+// LoadModelsRootConfig 读取 <root>/config/models-root.json 的 root 字段。
+// 文件缺失、JSON 非法或 root 为空时返回空串（调用方回落 DefaultModelsRoot）。
+// 兼容记事本写入的 UTF-8 BOM。
+func LoadModelsRootConfig(root string) string {
+	if strings.TrimSpace(root) == "" {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(root, "config", "models-root.json"))
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var f struct {
+		Root string `json:"root"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil {
+		log.Printf("[kernel] %s: %v", ModelsRootConfigRel, err)
+		return ""
+	}
+	return strings.TrimSpace(f.Root)
+}
 
 // modelRec 是 registry.ModelEntry 加上它的 map key（registry 里 id 是键，不在条目内）。
 type modelRec struct {
