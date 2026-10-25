@@ -129,6 +129,7 @@ async function openOverlayInternal(pluginId: string, opts: any = {}) {
     } catch (e) {}
   };
   ovWin.webContents.on("did-finish-load", pushEnv);
+  attachCrashRecovery(ovWin.webContents, "overlay:" + pluginId); // 页面 boot 自启循环、beforeunload 自停，reload 即安全恢复
   screen.on("display-metrics-changed", () => pushEnv());
   ovWin.on("closed", () => screen.removeListener("display-metrics-changed", pushEnv));
   ovWin.on("closed", () => {
@@ -195,6 +196,7 @@ function spawnPluginWindow(full: string, opts: any) {
   const emitSubState = () => { try { sub.webContents.send("win:state", sub.isMaximized() ? "max" : "normal"); } catch (e) {} };
   sub.on("maximize", emitSubState);
   sub.on("unmaximize", emitSubState);
+  attachCrashRecovery(sub.webContents, "插件窗口"); // URL 内嵌 auth，reload 即完整恢复
   sub.loadURL(full);
   return sub;
 }
@@ -409,6 +411,45 @@ function setupTray() {
   tray.on("click", showMain);
 }
 
+// ── 渲染进程崩溃自愈（根治长时运行白屏）─────────────────────────────
+// 长时运行下渲染进程可能因内存压力/GPU 重置等退出；崩溃后 Electron 只留白窗，
+// 必须由主进程监听 render-process-gone 主动重载恢复。
+// 2 分钟内崩溃 ≥3 次判定为循环崩溃：停止自动重载并弹窗提示，避免无限重载。
+const crashTimes = new WeakMap<any, number[]>();
+function crashLooped(wc: any): boolean {
+  const now = Date.now();
+  const arr = (crashTimes.get(wc) || []).filter((t: number) => now - t < 120000);
+  arr.push(now);
+  crashTimes.set(wc, arr);
+  return arr.length >= 3;
+}
+function attachCrashRecovery(wc: any, label: string) {
+  wc.on("render-process-gone", (_e: any, d: any) => {
+    console.error(`[host] ${label} 渲染进程退出: reason=${d && d.reason} exitCode=${d && d.exitCode}`);
+    if (!d || d.reason === "clean-exit") return; // 正常退出（窗口关闭中）无需恢复
+    if (crashLooped(wc)) {
+      console.error(`[host] ${label} 2 分钟内崩溃 3 次，停止自动重载`);
+      try { dialog.showErrorBox("OCTplugin", label + " 界面进程连续异常退出，已停止自动恢复，请手动重启应用。"); } catch (e) {}
+      return;
+    }
+    // 稍等再重载：崩溃瞬间立刻 reload 偶发失败，且给 GPU/驱动一点恢复时间
+    setTimeout(() => {
+      try {
+        if (!wc.isDestroyed()) { console.log(`[host] ${label} 崩溃自愈：重载页面`); wc.reload(); }
+      } catch (e) { /* 窗口已在关闭流程中 */ }
+    }, 800);
+  });
+  wc.on("did-fail-load", (_e: any, code: number, desc: string, url: string, isMainFrame: boolean) => {
+    if (isMainFrame && code !== -3) console.error(`[host] ${label} 主文档加载失败: ${code} ${desc} ${url}`);
+  });
+  wc.on("unresponsive", () => console.warn(`[host] ${label} 渲染进程无响应`));
+  wc.on("responsive", () => console.log(`[host] ${label} 渲染进程恢复响应`));
+}
+// GPU 等辅助进程崩溃通常由 Chromium 自动重建，这里只留诊断日志（整窗白屏多由渲染进程本身崩溃导致）。
+app.on("child-process-gone", (_e: any, d: any) => {
+  console.error(`[host] 子进程退出: type=${d && d.type} reason=${d && d.reason} exitCode=${d && d.exitCode}`);
+});
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1120,
@@ -464,12 +505,18 @@ function createWindow() {
   const emitState = () => { try { win.webContents.send("win:state", win.isMaximized() ? "max" : "normal"); } catch (e) {} };
   win.on("maximize", emitState);
   win.on("unmaximize", emitState);
-  // 等 renderer 完成加载后再启动链路，避免 send 早于监听而丢失
+  // 等 renderer 完成加载后再启动链路，避免 send 早于监听而丢失。
+  // 首次加载走完整 bootstrap；崩溃自愈触发的重载走 recoverAfterReload（内核链路还活着
+  // 就只重发 kernel:ready，死了就整链重启内核），绝不二次 spawn 内核。
+  attachCrashRecovery(win.webContents, "主窗");
   win.webContents.on("did-finish-load", () => {
-    if (win._booted) return;
-    win._booted = true;
     emitState();
-    bootstrap();
+    if (!win._bootstrapped) {
+      win._bootstrapped = true;
+      bootstrap();
+    } else if (kernelAuth) {
+      recoverAfterReload();
+    }
   });
 }
 
@@ -502,6 +549,43 @@ async function autoGrantFirstParty() {
   }
 }
 
+// 把内核连接信息（重）发给主窗渲染层。首启与崩溃自愈重载共用：
+// 渲染层拿到 kernel:ready 会重建侧栏与插件 iframe（renderPlugins 可重入）。
+async function reannounceKernel() {
+  if (!kernelAuth) return;
+  const list = await rpc("plugin.list", {});
+  // 判活：启动链路耗时期间用户可能已关窗
+  if (win && !win.isDestroyed()) win.webContents.send("kernel:ready", {
+    list,
+    kernelBase: `http://127.0.0.1:${kernelAuth.port}/`,
+    resBase: `http://127.0.0.1:${kernelAuth.port}/res/`,
+    port: kernelAuth.port, token: kernelAuth.token,
+  });
+  // §27：启动早期经「打开方式」收到的文件，内核就绪后再补发（renderer 面板此时已装配）。
+  if (pendingOpenFile) {
+    const f = pendingOpenFile; pendingOpenFile = "";
+    try { if (win && !win.isDestroyed()) win.webContents.send("file:open", { path: f }); } catch (e) { /* 忽略 */ }
+  }
+}
+
+// 崩溃自愈重载后的恢复：内核 WS 还活着 → 轻量重发 kernel:ready（渲染层自行重建面板/iframe）；
+// 内核没了或连接死了 → 杀掉 kerneld 残留后整链重启（bootstrap 会重新 spawn + connect）。
+async function recoverAfterReload() {
+  try {
+    if (ws && ws.readyState === 1) {
+      console.log("[host] 崩溃自愈：内核连接仍存活，重发 kernel:ready");
+      await reannounceKernel();
+      return;
+    }
+    console.warn("[host] 崩溃自愈：内核连接已失效，重启内核链路");
+    if (kernelProc) { try { kernelProc.kill(); } catch (e) { /* 已退出 */ } kernelProc = null; }
+    ws = null;
+    await bootstrap();
+  } catch (e: any) {
+    console.error("[host] 崩溃自愈失败:", String((e && e.message) || e));
+  }
+}
+
 async function bootstrap() {
   try {
     const auth = await startKernel();
@@ -509,19 +593,7 @@ async function bootstrap() {
     await connect(auth);
     await applyHotkeys(); // 阶段L：内核连上后再注册全局热键（触发时要经 plugin.call 派发）
     await autoGrantFirstParty(); // 一方插件放权须早于首屏，避免自检显示未授权
-    const list = await rpc("plugin.list", {});
-    // 判活：启动链路耗时期间用户可能已关窗
-    if (win && !win.isDestroyed()) win.webContents.send("kernel:ready", {
-      list,
-      kernelBase: `http://127.0.0.1:${auth.port}/`,
-      resBase: `http://127.0.0.1:${auth.port}/res/`,
-      port: auth.port, token: auth.token,
-    });
-    // §27：启动早期经「打开方式」收到的文件，内核就绪后再补发（renderer 面板此时已装配）。
-    if (pendingOpenFile) {
-      const f = pendingOpenFile; pendingOpenFile = "";
-      try { if (win && !win.isDestroyed()) win.webContents.send("file:open", { path: f }); } catch (e) { /* 忽略 */ }
-    }
+    await reannounceKernel();
     // §7 默认模型预加载（转化域 §四：加载权在宿主）：不阻塞首屏，后台确保默认能力模型就绪。
     // 每能力选默认最快模型（MVP：ocr=rapidocr，其余能力有模型声明后自动覆盖）。
     preloadDefaultModels();
@@ -713,7 +785,7 @@ let pendingOpenFile = ""; // bootstrap 完成前收到的打开请求，就绪�
 function handleOpenFile(p: string) {
   if (!win) return;
   win.show(); win.focus();
-  if (win._booted) {
+  if (win._bootstrapped) {
     try { win.webContents.send("file:open", { path: p }); } catch (e) { /* 窗口未就绪则稍后由 bootstrap 补发 */ }
   } else {
     pendingOpenFile = p;

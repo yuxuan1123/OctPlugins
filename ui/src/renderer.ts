@@ -149,6 +149,10 @@ const DEBUG_EVENTS = false;
       // 清空上一次动态区（保留 设置/调试 的“工作区”与新组）
       $$(".plugin-nav").forEach(n => n.remove());
       $$(".plugin-panel").forEach(p => p.remove());
+      // 重建的 iframe 全是新实例：必须重置握手记录，否则 mount() 会因 mounted.has(pid)
+      // 跳过 oct.hello → 插件页拿不到连接信息 → 永远空白。崩溃自愈重载与导入插件
+      // 重建面板都依赖这里的可重入性。
+      mounted.clear();
       const web = plugins.filter(p => p.ui && p.ui.type === "web");
       if (web.length) {
         const sep = document.createElement("div");
